@@ -1,8 +1,12 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::fs::{self, DirEntry, File};
+use std::io::{BufRead, BufReader};
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -21,11 +25,6 @@ const KNOWN_LATER_SUBCOMMANDS: &[&str] = &[
     "settings.delete",
     "settings.validate",
     "settings.migrate",
-    "session.locate_transcript",
-    "session.read_turns",
-    "session.capture",
-    "session.export",
-    "session.replace",
     "rotation.assess",
     "rotation.materialize",
     "discovery.models",
@@ -151,6 +150,37 @@ struct QuotaRefreshAuthParams {
     #[allow(dead_code)]
     force: Option<bool>,
     context: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionParams {
+    settings_id: String,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    model_name: Option<String>,
+    #[serde(default)]
+    provider_name: Option<String>,
+    #[serde(default)]
+    context: Option<Value>,
+    #[serde(default)]
+    canonical_format: Option<String>,
+    #[serde(default)]
+    data_base64: Option<String>,
+    #[serde(default)]
+    preimage_sha256: Option<String>,
+    #[serde(default)]
+    stdout_base64: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    stderr_base64: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    state: Option<Value>,
+    #[serde(default)]
+    capture: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -420,6 +450,11 @@ fn handle_decoded_invocation(
         "quota.source" => quota_source_response(request),
         "quota.probe" => quota_probe_response(request),
         "quota.refresh_auth" => quota_refresh_auth_response(request),
+        "session.locate_transcript" => session_locate_transcript_response(request),
+        "session.read_turns" => session_read_turns_response(request),
+        "session.capture" => session_capture_response(request),
+        "session.export" => session_export_response(request),
+        "session.replace" => session_replace_response(request),
         known if KNOWN_LATER_SUBCOMMANDS.contains(&known) => Err(ProviderFailure::unsupported(
             request.request_id,
             "capability_not_implemented",
@@ -740,6 +775,202 @@ fn quota_refresh_auth_response(request: RequestEnvelope) -> Result<Value, Provid
             "available": true,
             "checked_at_unix_ms": context_u64(&params.context, "now_unix_ms").unwrap_or_else(now_unix_ms),
             "detail": "token refreshed",
+        }),
+    ))
+}
+
+fn session_locate_transcript_response(request: RequestEnvelope) -> Result<Value, ProviderFailure> {
+    let request_id = request.request_id.clone();
+    let config_root = request.host.config_root.clone();
+    let provider_instance_id = request.provider_instance_id.clone();
+    let params = decode_session_params(request, "invalid_session_locate_params")?;
+    validate_settings_id(&request_id, &params.settings_id)?;
+    let session_id = require_session_id(&request_id, &params)?;
+    let settings = session_settings_for_request(
+        &params,
+        provider_instance_id.as_deref(),
+        config_root.as_deref(),
+    );
+    let located = locate_transcript(&request_id, &settings, &session_id)?;
+
+    Ok(success_response(
+        &request_id,
+        json!({
+            "located": true,
+            "path": located.display().to_string(),
+            "format_id": "claude_code",
+            "source_id": format!("claude:{}", params.settings_id),
+            "require_existing_observed": true,
+        }),
+    ))
+}
+
+fn session_read_turns_response(request: RequestEnvelope) -> Result<Value, ProviderFailure> {
+    let request_id = request.request_id.clone();
+    let config_root = request.host.config_root.clone();
+    let provider_instance_id = request.provider_instance_id.clone();
+    let params = decode_session_params(request, "invalid_session_read_turns_params")?;
+    validate_settings_id(&request_id, &params.settings_id)?;
+    let session_id = require_session_id(&request_id, &params)?;
+    let settings = session_settings_for_request(
+        &params,
+        provider_instance_id.as_deref(),
+        config_root.as_deref(),
+    );
+    let located = locate_transcript(&request_id, &settings, &session_id)?;
+    let mut turns = read_claude_turns(&request_id, &located, &session_id)?;
+    if let Some(after) = session_context_string(&params, "after_turn_id") {
+        if let Some(index) = turns
+            .iter()
+            .position(|turn| turn.get("turn_id").and_then(Value::as_str) == Some(after.as_str()))
+        {
+            turns = turns.split_off(index + 1);
+        }
+    }
+
+    Ok(success_response(
+        &request_id,
+        json!({
+            "turn_count": turns.len(),
+            "turns": turns,
+            "complete": transcript_is_complete(&located),
+        }),
+    ))
+}
+
+fn session_capture_response(request: RequestEnvelope) -> Result<Value, ProviderFailure> {
+    let request_id = request.request_id.clone();
+    let config_root = request.host.config_root.clone();
+    let provider_instance_id = request.provider_instance_id.clone();
+    let params = decode_session_params(request, "invalid_session_capture_params")?;
+    validate_settings_id(&request_id, &params.settings_id)?;
+    let settings = session_settings_for_request(
+        &params,
+        provider_instance_id.as_deref(),
+        config_root.as_deref(),
+    );
+    let capture = params
+        .capture
+        .as_ref()
+        .and_then(|value| serde_json::from_value::<SessionCaptureSettings>(value.clone()).ok())
+        .or(settings.capture)
+        .unwrap_or_default();
+    let result = capture_result(&request_id, &params, &capture)?;
+    Ok(success_response(&request_id, result))
+}
+
+fn session_export_response(request: RequestEnvelope) -> Result<Value, ProviderFailure> {
+    let request_id = request.request_id.clone();
+    let config_root = request.host.config_root.clone();
+    let provider_instance_id = request.provider_instance_id.clone();
+    let params = decode_session_params(request, "invalid_session_export_params")?;
+    validate_settings_id(&request_id, &params.settings_id)?;
+    let session_id = require_session_id(&request_id, &params)?;
+    let settings = session_settings_for_request(
+        &params,
+        provider_instance_id.as_deref(),
+        config_root.as_deref(),
+    );
+    let located = locate_transcript(&request_id, &settings, &session_id)?;
+    let provider_name = provider_name_for_session(&params);
+    let records =
+        canonical_records_from_claude_file(&request_id, &located, &session_id, &provider_name)?;
+    let bytes = canonical_jsonl_bytes(&request_id, &records)?;
+
+    Ok(success_response(
+        &request_id,
+        json!({
+            "canonical_format": "oulipoly.canonical_transcript/v1",
+            "data_base64": encode_base64(&bytes),
+            "turn_count": records.len(),
+            "sha256": sha256_hex(&bytes),
+        }),
+    ))
+}
+
+fn session_replace_response(request: RequestEnvelope) -> Result<Value, ProviderFailure> {
+    let request_id = request.request_id.clone();
+    let config_root = request.host.config_root.clone();
+    let provider_instance_id = request.provider_instance_id.clone();
+    let params = decode_session_params(request, "invalid_session_replace_params")?;
+    validate_settings_id(&request_id, &params.settings_id)?;
+    let session_id = require_session_id(&request_id, &params)?;
+    validate_canonical_format(&request_id, &params)?;
+    let replacement_bytes = replacement_bytes(&request_id, &params)?;
+    let replacement_records = parse_canonical_jsonl(&request_id, &replacement_bytes)?;
+    validate_replacement_records(
+        &request_id,
+        &replacement_records,
+        &session_id,
+        &provider_name_for_session(&params),
+    )?;
+    let settings = session_settings_for_request(
+        &params,
+        provider_instance_id.as_deref(),
+        config_root.as_deref(),
+    );
+    let located = locate_transcript(&request_id, &settings, &session_id)?;
+    let provider_name = provider_name_for_session(&params);
+    let existing_records =
+        canonical_records_from_claude_file(&request_id, &located, &session_id, &provider_name)?;
+    let existing_bytes = canonical_jsonl_bytes(&request_id, &existing_records)?;
+    let existing_hash = sha256_hex(&existing_bytes);
+    if let Some(expected) = params.preimage_sha256.as_deref() {
+        if expected != existing_hash {
+            return Err(ProviderFailure::unavailable(
+                request_id,
+                "preimage_mismatch",
+                "session.replace preimage_sha256 does not match current canonical transcript",
+                false,
+                json!({ "expected": expected, "actual": existing_hash }),
+            ));
+        }
+    }
+    let replacement_hash = sha256_hex(&replacement_bytes);
+    if replacement_bytes == existing_bytes {
+        return Ok(success_response(
+            &request_id,
+            json!({
+                "changed": false,
+                "artifacts": [session_artifact(&located, &replacement_hash)],
+            }),
+        ));
+    }
+
+    let rendered = render_claude_records(&request_id, &replacement_records)?;
+    atomic_replace_file(&request_id, &located, &rendered)?;
+    let fresh_records =
+        canonical_records_from_claude_file(&request_id, &located, &session_id, &provider_name)?;
+    let fresh_bytes = canonical_jsonl_bytes(&request_id, &fresh_records)?;
+    let postimage_hash = sha256_hex(&fresh_bytes);
+    if !canonical_semantics_equal(&replacement_records, &fresh_records) {
+        return Err(ProviderFailure::unavailable(
+            request_id,
+            "postimage_mismatch",
+            "fresh canonical export after replace does not match replacement semantics",
+            false,
+            json!({ "replacement_sha256": replacement_hash, "postimage_sha256": postimage_hash }),
+        ));
+    }
+    let artifacts = vec![session_artifact(&located, &postimage_hash)];
+
+    Ok(success_response(
+        &request_id,
+        json!({
+            "changed": true,
+            "postimage_sha256": postimage_hash,
+            "artifacts": artifacts,
+            "host_state_plan": {
+                "schema_version": 1,
+                "operation": "session.replace",
+                "session_id": session_id,
+                "provider_name": provider_name,
+                "canonical_format": "oulipoly.canonical_transcript/v1",
+                "turn_count": fresh_records.len(),
+                "records_sha256": replacement_hash,
+                "postimage_sha256": postimage_hash,
+                "artifacts": artifacts,
+            },
         }),
     ))
 }
@@ -1131,6 +1362,83 @@ struct ProviderQuotaSettings {
     auth_refresh_command: Option<String>,
 }
 
+#[derive(Default)]
+struct ProviderSessionSettings {
+    storage: Option<SessionStorage>,
+    capture: Option<SessionCaptureSettings>,
+}
+
+#[derive(Clone)]
+enum SessionStorage {
+    ClaudeCode {
+        projects_dir: PathBuf,
+    },
+    Script {
+        locate_script: Option<String>,
+        #[allow(dead_code)]
+        turns_script: Option<String>,
+    },
+}
+
+#[derive(Clone, Default, Deserialize)]
+struct SessionCaptureSettings {
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    flag: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    json_flag: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    last_message_flag: Option<String>,
+    #[serde(default)]
+    event_type: Option<String>,
+    #[serde(default)]
+    event_id_path: Option<String>,
+    #[serde(default)]
+    provider_session_id: Option<String>,
+    #[serde(default)]
+    start_known_provider_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CanonicalRecord {
+    session_id: String,
+    provider_name: String,
+    turn_id: String,
+    role: String,
+    timestamp: String,
+    content: Vec<ContentChunk>,
+    source: RecordSource,
+    unsupported_record: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ContentChunk {
+    #[serde(rename = "type")]
+    chunk_type: String,
+    text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RecordSource {
+    storage_type: String,
+    jsonl_path: PathBuf,
+    line: u64,
+    byte_start: u64,
+    byte_end: u64,
+    sha256: String,
+}
+
+struct SourceLine {
+    line: u64,
+    byte_start: u64,
+    byte_end: u64,
+    sha256: String,
+    value: Value,
+}
+
 fn provider_quota_settings(
     context: &Option<Value>,
     settings_id: &str,
@@ -1150,6 +1458,1149 @@ fn provider_quota_settings(
         }
     }
     active_has_quota(&settings).then_some(settings)
+}
+
+fn decode_session_params(
+    request: RequestEnvelope,
+    code: &'static str,
+) -> Result<SessionParams, ProviderFailure> {
+    serde_json::from_value(request.params).map_err(|err| {
+        ProviderFailure::invalid_request(
+            request.request_id,
+            code,
+            format!("session params do not match the provider contract: {err}"),
+        )
+    })
+}
+
+fn require_session_id(request_id: &str, params: &SessionParams) -> Result<String, ProviderFailure> {
+    params
+        .session_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            ProviderFailure::invalid_request(
+                request_id.to_string(),
+                "invalid_session_id",
+                "session_id must be non-empty",
+            )
+        })
+}
+
+fn validate_canonical_format(
+    request_id: &str,
+    params: &SessionParams,
+) -> Result<(), ProviderFailure> {
+    if params.canonical_format.as_deref() == Some("oulipoly.canonical_transcript/v1") {
+        return Ok(());
+    }
+    Err(ProviderFailure::invalid_request(
+        request_id.to_string(),
+        "invalid_canonical_format",
+        "session.replace requires canonical_format=oulipoly.canonical_transcript/v1",
+    ))
+}
+
+fn replacement_bytes(request_id: &str, params: &SessionParams) -> Result<Vec<u8>, ProviderFailure> {
+    let data = params.data_base64.as_deref().ok_or_else(|| {
+        ProviderFailure::invalid_request(
+            request_id.to_string(),
+            "missing_replacement_data",
+            "session.replace requires data_base64",
+        )
+    })?;
+    decode_base64(data).map_err(|err| {
+        ProviderFailure::invalid_request(
+            request_id.to_string(),
+            "invalid_replacement_base64",
+            format!("data_base64 is invalid: {err}"),
+        )
+    })
+}
+
+fn provider_name_for_session(params: &SessionParams) -> String {
+    params
+        .provider_name
+        .clone()
+        .or_else(|| session_context_string(params, "provider_name"))
+        .unwrap_or_else(|| params.settings_id.clone())
+}
+
+fn session_settings_for_request(
+    params: &SessionParams,
+    provider_instance_id: Option<&str>,
+    config_root: Option<&str>,
+) -> ProviderSessionSettings {
+    let mut settings = ProviderSessionSettings::default();
+    if let Some(storage) = session_storage_from_context(&params.context) {
+        settings.storage = Some(storage);
+    }
+    if let Some(capture) = session_capture_from_context(&params.context) {
+        settings.capture = Some(capture);
+    }
+    if settings.storage.is_some() && settings.capture.is_some() {
+        return settings;
+    }
+    if let Some(from_config) = provider_session_settings(
+        &params.context,
+        &params.settings_id,
+        provider_instance_id,
+        config_root,
+    ) {
+        if settings.storage.is_none() {
+            settings.storage = from_config.storage;
+        }
+        if settings.capture.is_none() {
+            settings.capture = from_config.capture;
+        }
+    }
+    settings
+}
+
+fn provider_session_settings(
+    context: &Option<Value>,
+    settings_id: &str,
+    provider_instance_id: Option<&str>,
+    config_root: Option<&str>,
+) -> Option<ProviderSessionSettings> {
+    let providers_toml = Path::new(config_root?).join("providers.toml");
+    let parsed: toml::Value = toml::from_str(&fs::read_to_string(providers_toml).ok()?).ok()?;
+    let candidates = provider_config_candidates(context, provider_instance_id, settings_id);
+    candidates
+        .iter()
+        .map(|candidate| parse_provider_session_settings_for_candidate(&parsed, candidate))
+        .find(|settings| settings.storage.is_some() || settings.capture.is_some())
+}
+
+fn parse_provider_session_settings_for_candidate(
+    providers_toml: &toml::Value,
+    candidate: &str,
+) -> ProviderSessionSettings {
+    let mut settings = ProviderSessionSettings::default();
+    let Some(table) = providers_toml.get(candidate) else {
+        return settings;
+    };
+    settings.storage = table
+        .get("session_storage")
+        .and_then(session_storage_from_toml);
+    settings.capture = table
+        .get("session_capture")
+        .and_then(|value| value.clone().try_into::<SessionCaptureSettings>().ok());
+    settings
+}
+
+fn session_storage_from_context(context: &Option<Value>) -> Option<SessionStorage> {
+    let storage = context
+        .as_ref()
+        .and_then(|value| nested_context_value(value, "session_storage"))?;
+    session_storage_from_value(storage)
+}
+
+fn session_capture_from_context(context: &Option<Value>) -> Option<SessionCaptureSettings> {
+    let capture = context
+        .as_ref()
+        .and_then(|value| nested_context_value(value, "session_capture"))?;
+    serde_json::from_value(capture.clone()).ok()
+}
+
+fn session_storage_from_value(value: &Value) -> Option<SessionStorage> {
+    let kind = value.get("kind").and_then(Value::as_str)?;
+    match kind {
+        "claude_code" => value
+            .get("projects_dir")
+            .and_then(Value::as_str)
+            .map(|projects_dir| SessionStorage::ClaudeCode {
+                projects_dir: expand_home_path(projects_dir),
+            }),
+        "script" => Some(SessionStorage::Script {
+            locate_script: value
+                .get("locate_script")
+                .or_else(|| value.get("transcript_script"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            turns_script: value
+                .get("turns_script")
+                .or_else(|| value.get("turn_script"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        }),
+        _ => None,
+    }
+}
+
+fn session_storage_from_toml(value: &toml::Value) -> Option<SessionStorage> {
+    let kind = table_string(value, "kind")?;
+    match kind.as_str() {
+        "claude_code" => {
+            table_string(value, "projects_dir").map(|projects_dir| SessionStorage::ClaudeCode {
+                projects_dir: expand_home_path(&projects_dir),
+            })
+        }
+        "script" => Some(SessionStorage::Script {
+            locate_script: table_string(value, "locate_script")
+                .or_else(|| table_string(value, "transcript_script")),
+            turns_script: table_string(value, "turns_script")
+                .or_else(|| table_string(value, "turn_script")),
+        }),
+        _ => None,
+    }
+}
+
+fn expand_home_path(path: &str) -> PathBuf {
+    if path == "~" {
+        return std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(path));
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(path)
+}
+
+fn locate_transcript(
+    request_id: &str,
+    settings: &ProviderSessionSettings,
+    session_id: &str,
+) -> Result<PathBuf, ProviderFailure> {
+    match settings.storage.as_ref() {
+        Some(SessionStorage::ClaudeCode { projects_dir }) => {
+            locate_claude_project_transcript(request_id, projects_dir, session_id)
+        }
+        Some(SessionStorage::Script { locate_script, .. }) => {
+            locate_transcript_with_script(request_id, locate_script.as_deref(), session_id)
+        }
+        None => Err(ProviderFailure::unavailable(
+            request_id.to_string(),
+            "session_storage_unavailable",
+            "session operation requires session_storage in context or providers.toml",
+            false,
+            json!({}),
+        )),
+    }
+}
+
+fn locate_transcript_with_script(
+    request_id: &str,
+    locate_script: Option<&str>,
+    session_id: &str,
+) -> Result<PathBuf, ProviderFailure> {
+    let Some(script) = locate_script else {
+        return Err(ProviderFailure::unavailable(
+            request_id.to_string(),
+            "session_locator_unavailable",
+            "script session_storage requires locate_script",
+            false,
+            json!({}),
+        ));
+    };
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .env("SESSION_ID", session_id)
+        .output()
+        .map_err(|err| {
+            ProviderFailure::unavailable(
+                request_id.to_string(),
+                "session_locator_failed",
+                format!("failed to spawn transcript locator: {err}"),
+                true,
+                json!({}),
+            )
+        })?;
+    if !output.status.success() {
+        return Err(ProviderFailure::unavailable(
+            request_id.to_string(),
+            "session_not_found",
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            false,
+            json!({ "session_id": session_id }),
+        ));
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    canonical_existing_jsonl(request_id, PathBuf::from(path))
+}
+
+fn locate_claude_project_transcript(
+    request_id: &str,
+    projects_dir: &Path,
+    session_id: &str,
+) -> Result<PathBuf, ProviderFailure> {
+    let root = projects_dir.canonicalize().map_err(|err| {
+        ProviderFailure::unavailable(
+            request_id.to_string(),
+            "claude_projects_dir_unavailable",
+            format!(
+                "failed to access Claude projects dir {}: {err}",
+                projects_dir.display()
+            ),
+            false,
+            json!({ "path": projects_dir.display().to_string() }),
+        )
+    })?;
+    let target = format!("{session_id}.jsonl");
+    let mut matches = Vec::new();
+    collect_named_jsonl_matches(request_id, &root, &target, 0, &mut matches)?;
+    if matches.is_empty() {
+        collect_content_jsonl_matches(request_id, &root, session_id, 0, &mut matches)?;
+    }
+    match matches.len() {
+        1 => canonical_existing_jsonl(request_id, matches.remove(0)),
+        0 => Err(ProviderFailure::unavailable(
+            request_id.to_string(),
+            "session_not_found",
+            format!("session not found: {session_id}"),
+            false,
+            json!({ "session_id": session_id }),
+        )),
+        _ => Err(ProviderFailure::unavailable(
+            request_id.to_string(),
+            "ambiguous_session",
+            format!("multiple Claude transcripts matched session {session_id}"),
+            false,
+            json!({ "session_id": session_id }),
+        )),
+    }
+}
+
+fn collect_named_jsonl_matches(
+    request_id: &str,
+    dir: &Path,
+    target: &str,
+    depth: usize,
+    matches: &mut Vec<PathBuf>,
+) -> Result<(), ProviderFailure> {
+    if depth > 4 {
+        return Ok(());
+    }
+    for entry in read_dir_entries(request_id, dir)? {
+        let path = entry.path();
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            collect_named_jsonl_matches(request_id, &path, target, depth + 1, matches)?;
+        } else if path.file_name().and_then(|name| name.to_str()) == Some(target) && path.is_file()
+        {
+            matches.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn collect_content_jsonl_matches(
+    request_id: &str,
+    dir: &Path,
+    session_id: &str,
+    depth: usize,
+    matches: &mut Vec<PathBuf>,
+) -> Result<(), ProviderFailure> {
+    if depth > 4 {
+        return Ok(());
+    }
+    for entry in read_dir_entries(request_id, dir)? {
+        let path = entry.path();
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            collect_content_jsonl_matches(request_id, &path, session_id, depth + 1, matches)?;
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+            && file_contains_session_id(&path, session_id)
+        {
+            matches.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn read_dir_entries(request_id: &str, dir: &Path) -> Result<Vec<DirEntry>, ProviderFailure> {
+    fs::read_dir(dir)
+        .map_err(|err| {
+            ProviderFailure::unavailable(
+                request_id.to_string(),
+                "session_storage_read_failed",
+                format!(
+                    "failed to read session storage dir {}: {err}",
+                    dir.display()
+                ),
+                false,
+                json!({ "path": dir.display().to_string() }),
+            )
+        })?
+        .map(|entry| {
+            entry.map_err(|err| {
+                ProviderFailure::unavailable(
+                    request_id.to_string(),
+                    "session_storage_read_failed",
+                    format!(
+                        "failed to read session storage entry in {}: {err}",
+                        dir.display()
+                    ),
+                    false,
+                    json!({ "path": dir.display().to_string() }),
+                )
+            })
+        })
+        .collect()
+}
+
+fn canonical_existing_jsonl(request_id: &str, path: PathBuf) -> Result<PathBuf, ProviderFailure> {
+    let path = path.canonicalize().map_err(|err| {
+        ProviderFailure::unavailable(
+            request_id.to_string(),
+            "transcript_unavailable",
+            format!(
+                "failed to canonicalize transcript {}: {err}",
+                path.display()
+            ),
+            false,
+            json!({ "path": path.display().to_string() }),
+        )
+    })?;
+    if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") && path.is_file() {
+        return Ok(path);
+    }
+    Err(ProviderFailure::unavailable(
+        request_id.to_string(),
+        "invalid_transcript_path",
+        "located transcript must be an existing .jsonl file",
+        false,
+        json!({ "path": path.display().to_string() }),
+    ))
+}
+
+fn file_contains_session_id(path: &Path, session_id: &str) -> bool {
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .any(|line| {
+            serde_json::from_str::<Value>(line.trim())
+                .ok()
+                .is_some_and(|value| {
+                    value
+                        .get("sessionId")
+                        .and_then(Value::as_str)
+                        .is_some_and(|recorded| recorded == session_id)
+                })
+        })
+}
+
+fn read_claude_turns(
+    request_id: &str,
+    path: &Path,
+    session_id: &str,
+) -> Result<Vec<Value>, ProviderFailure> {
+    let lines = scan_jsonl_file(request_id, path)?;
+    let mut turns = Vec::new();
+    for line in lines {
+        if line.value.get("sessionId").and_then(Value::as_str) != Some(session_id) {
+            continue;
+        }
+        let kind = line.value.get("type").and_then(Value::as_str);
+        let compact = line
+            .value
+            .get("isCompactSummary")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !matches!(kind, Some("user" | "assistant")) && !compact {
+            continue;
+        }
+        let Some(turn_id) = line.value.get("uuid").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(timestamp) = line.value.get("timestamp").and_then(Value::as_str) else {
+            continue;
+        };
+        let mut turn = json!({
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "timestamp": timestamp,
+            "role": kind,
+            "parent_turn_id": line.value.get("parentUuid").cloned().unwrap_or(Value::Null),
+            "is_sidechain": line.value.get("isSidechain").cloned().unwrap_or(Value::Null),
+            "is_compaction_boundary": compact,
+            "status": if transcript_is_complete(path) { "complete" } else { "partial" },
+        });
+        let body = extract_claude_body_json(&line.value);
+        if !body.is_empty() {
+            turn["body"] = Value::Array(body);
+        }
+        turns.push(turn);
+    }
+    Ok(turns)
+}
+
+fn transcript_is_complete(path: &Path) -> bool {
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    bytes.is_empty() || bytes.last() == Some(&b'\n')
+}
+
+fn capture_result(
+    request_id: &str,
+    params: &SessionParams,
+    capture: &SessionCaptureSettings,
+) -> Result<Value, ProviderFailure> {
+    if let Some(known) = capture
+        .start_known_provider_session_id
+        .as_deref()
+        .or(capture.provider_session_id.as_deref())
+        .or(params.session_id.as_deref())
+        .filter(|value| !value.trim().is_empty() && capture.kind == "start_known")
+    {
+        return Ok(json!({
+            "provider_session_id": known,
+            "state": { "capture_kind": "start_known" },
+            "artifacts": [],
+        }));
+    }
+    match capture.kind.as_str() {
+        "" | "none" => Ok(json!({
+            "provider_session_id": Value::Null,
+            "state": { "capture_kind": "none" },
+            "artifacts": [],
+        })),
+        "forced_flag_verified" => {
+            let requested = params
+                .session_id
+                .as_deref()
+                .or(capture.provider_session_id.as_deref())
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    ProviderFailure::invalid_request(
+                        request_id.to_string(),
+                        "missing_forced_capture_session_id",
+                        "forced_flag_verified capture requires session_id or provider_session_id",
+                    )
+                })?;
+            Ok(json!({
+                "provider_session_id": requested,
+                "state": {
+                    "capture_kind": "forced_flag_verified",
+                    "flag": capture.flag,
+                    "verified": true,
+                },
+                "artifacts": [],
+            }))
+        }
+        "stdout_json_event" => {
+            let stdout = params
+                .stdout_base64
+                .as_deref()
+                .map(decode_base64)
+                .transpose()
+                .map_err(|err| {
+                    ProviderFailure::invalid_request(
+                        request_id.to_string(),
+                        "invalid_capture_stdout_base64",
+                        format!("stdout_base64 is invalid: {err}"),
+                    )
+                })?
+                .unwrap_or_default();
+            let event_type = capture.event_type.as_deref().unwrap_or("system");
+            let event_id_path = capture.event_id_path.as_deref().unwrap_or("session_id");
+            let provider_session_id =
+                capture_stdout_event_session_id(&stdout, event_type, event_id_path);
+            Ok(json!({
+                "provider_session_id": provider_session_id,
+                "state": {
+                    "capture_kind": "stdout_json_event",
+                    "event_type": event_type,
+                    "event_id_path": event_id_path,
+                    "found": provider_session_id.is_some(),
+                },
+                "artifacts": [],
+            }))
+        }
+        other => Err(ProviderFailure::invalid_request(
+            request_id.to_string(),
+            "invalid_capture_kind",
+            format!("unsupported session capture kind: {other}"),
+        )),
+    }
+}
+
+fn capture_stdout_event_session_id(
+    stdout: &[u8],
+    event_type: &str,
+    event_id_path: &str,
+) -> Option<String> {
+    let text = std::str::from_utf8(stdout).ok()?;
+    for line in text.lines() {
+        let value: Value = serde_json::from_str(line.trim()).ok()?;
+        if value.get("type").and_then(Value::as_str) != Some(event_type) {
+            continue;
+        }
+        if let Some(id) = json_path_string(&value, event_id_path) {
+            return Some(id.to_string());
+        }
+    }
+    None
+}
+
+fn json_path_string<'a>(value: &'a Value, path: &str) -> Option<&'a str> {
+    path.split('.')
+        .try_fold(value, |current, part| current.get(part))
+        .and_then(Value::as_str)
+}
+
+fn canonical_records_from_claude_file(
+    request_id: &str,
+    path: &Path,
+    session_id: &str,
+    provider_name: &str,
+) -> Result<Vec<CanonicalRecord>, ProviderFailure> {
+    let lines = scan_jsonl_file(request_id, path)?;
+    let mut records = Vec::new();
+    let mut latest_compaction_boundary = None;
+    for line in lines {
+        let Some(recorded_session_id) = line.value.get("sessionId").and_then(Value::as_str) else {
+            continue;
+        };
+        if recorded_session_id != session_id {
+            return Err(ProviderFailure::unavailable(
+                request_id.to_string(),
+                "malformed_transcript",
+                format!("transcript sessionId {recorded_session_id} does not match requested session {session_id}"),
+                false,
+                json!({ "path": path.display().to_string(), "line": line.line }),
+            ));
+        }
+        let Some(native_type) = line.value.get("type").and_then(Value::as_str) else {
+            continue;
+        };
+        let turn_id = required_json_string(request_id, path, &line, "uuid")?;
+        let timestamp = required_json_string(request_id, path, &line, "timestamp")?;
+        validate_rfc3339(request_id, path, line.line, &timestamp)?;
+        let unsupported_record = !matches!(native_type, "user" | "assistant");
+        let content = if unsupported_record {
+            Vec::new()
+        } else {
+            extract_claude_content(&line.value)
+        };
+        let record = CanonicalRecord {
+            session_id: session_id.to_string(),
+            provider_name: provider_name.to_string(),
+            turn_id,
+            role: native_type.to_string(),
+            timestamp,
+            content,
+            source: RecordSource {
+                storage_type: "claude_code".to_string(),
+                jsonl_path: path.to_path_buf(),
+                line: line.line,
+                byte_start: line.byte_start,
+                byte_end: line.byte_end,
+                sha256: line.sha256,
+            },
+            unsupported_record,
+        };
+        if line
+            .value
+            .get("isCompactSummary")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            latest_compaction_boundary = Some(records.len());
+        }
+        records.push(record);
+    }
+    if let Some(index) = latest_compaction_boundary {
+        records = records.into_iter().skip(index).collect();
+    }
+    validate_record_order(request_id, path, &records)?;
+    Ok(records)
+}
+
+fn scan_jsonl_file(request_id: &str, path: &Path) -> Result<Vec<SourceLine>, ProviderFailure> {
+    let bytes = fs::read(path).map_err(|err| {
+        ProviderFailure::unavailable(
+            request_id.to_string(),
+            "transcript_read_failed",
+            format!("failed to read transcript {}: {err}", path.display()),
+            false,
+            json!({ "path": path.display().to_string() }),
+        )
+    })?;
+    scan_jsonl_bytes(request_id, path, &bytes)
+}
+
+fn scan_jsonl_bytes(
+    request_id: &str,
+    path: &Path,
+    bytes: &[u8],
+) -> Result<Vec<SourceLine>, ProviderFailure> {
+    let mut out = Vec::new();
+    let mut line = 1_u64;
+    let mut offset = 0_usize;
+    while offset < bytes.len() {
+        let start = offset;
+        while offset < bytes.len() && bytes[offset] != b'\n' {
+            offset += 1;
+        }
+        let mut end = offset;
+        if end > start && bytes[end - 1] == b'\r' {
+            end -= 1;
+        }
+        let line_bytes = &bytes[start..end];
+        if !line_bytes.iter().all(u8::is_ascii_whitespace) {
+            let text = std::str::from_utf8(line_bytes).map_err(|err| {
+                malformed_transcript(request_id, path, line, format!("line is not UTF-8: {err}"))
+            })?;
+            let value = serde_json::from_str::<Value>(text).map_err(|err| {
+                malformed_transcript(
+                    request_id,
+                    path,
+                    line,
+                    format!("line is not valid JSON: {err}"),
+                )
+            })?;
+            out.push(SourceLine {
+                line,
+                byte_start: start as u64,
+                byte_end: end as u64,
+                sha256: sha256_hex(line_bytes),
+                value,
+            });
+        }
+        if offset < bytes.len() && bytes[offset] == b'\n' {
+            offset += 1;
+        }
+        line += 1;
+    }
+    Ok(out)
+}
+
+fn required_json_string(
+    request_id: &str,
+    path: &Path,
+    line: &SourceLine,
+    field: &str,
+) -> Result<String, ProviderFailure> {
+    line.value
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            malformed_transcript(
+                request_id,
+                path,
+                line.line,
+                format!("transcript line is missing required {field}"),
+            )
+        })
+}
+
+fn validate_rfc3339(
+    request_id: &str,
+    path: &Path,
+    line: u64,
+    timestamp: &str,
+) -> Result<(), ProviderFailure> {
+    DateTime::parse_from_rfc3339(timestamp)
+        .map(|_| ())
+        .map_err(|err| {
+            malformed_transcript(
+                request_id,
+                path,
+                line,
+                format!("transcript timestamp is not RFC3339: {err}"),
+            )
+        })
+}
+
+fn validate_record_order(
+    request_id: &str,
+    path: &Path,
+    records: &[CanonicalRecord],
+) -> Result<(), ProviderFailure> {
+    let mut previous: Option<DateTime<Utc>> = None;
+    for record in records {
+        let current = DateTime::parse_from_rfc3339(&record.timestamp)
+            .map(|timestamp| timestamp.with_timezone(&Utc))
+            .map_err(|err| {
+                malformed_transcript(
+                    request_id,
+                    path,
+                    record.source.line,
+                    format!("transcript timestamp is not RFC3339: {err}"),
+                )
+            })?;
+        if previous.is_some_and(|previous| current < previous) {
+            return Err(malformed_transcript(
+                request_id,
+                path,
+                record.source.line,
+                "transcript timestamps are not in provider order".to_string(),
+            ));
+        }
+        previous = Some(current);
+    }
+    Ok(())
+}
+
+fn malformed_transcript(
+    request_id: &str,
+    path: &Path,
+    line: u64,
+    reason: String,
+) -> ProviderFailure {
+    ProviderFailure::unavailable(
+        request_id.to_string(),
+        "malformed_transcript",
+        reason,
+        false,
+        json!({ "path": path.display().to_string(), "line": line }),
+    )
+}
+
+fn extract_claude_content(value: &Value) -> Vec<ContentChunk> {
+    if let Some(message) = value.get("message") {
+        if let Some(text) = message.as_str() {
+            return vec![text_chunk(text)];
+        }
+        if let Some(content) = message.get("content") {
+            return extract_content_chunks(Some(content));
+        }
+    }
+    extract_content_chunks(value.get("content"))
+}
+
+fn extract_claude_body_json(value: &Value) -> Vec<Value> {
+    extract_claude_content(value)
+        .into_iter()
+        .map(|chunk| json!({ "type": chunk.chunk_type, "text": chunk.text.unwrap_or_default() }))
+        .collect()
+}
+
+fn extract_content_chunks(value: Option<&Value>) -> Vec<ContentChunk> {
+    match value {
+        Some(Value::String(text)) => vec![text_chunk(text)],
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| {
+                if let Some(text) = item.as_str() {
+                    return Some(text_chunk(text));
+                }
+                let item_type = item.get("type").and_then(Value::as_str).unwrap_or("text");
+                let text = item
+                    .get("text")
+                    .or_else(|| item.get("content"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                text.map(|text| ContentChunk {
+                    chunk_type: canonical_chunk_type(item_type).to_string(),
+                    text: Some(text),
+                })
+            })
+            .collect(),
+        Some(Value::Object(object)) => object
+            .get("text")
+            .or_else(|| object.get("content"))
+            .and_then(Value::as_str)
+            .map(|text| vec![text_chunk(text)])
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+fn canonical_chunk_type(native_type: &str) -> &str {
+    match native_type {
+        "input_text" | "output_text" => "text",
+        other => other,
+    }
+}
+
+fn text_chunk(text: &str) -> ContentChunk {
+    ContentChunk {
+        chunk_type: "text".to_string(),
+        text: Some(text.to_string()),
+    }
+}
+
+fn canonical_jsonl_bytes(
+    request_id: &str,
+    records: &[CanonicalRecord],
+) -> Result<Vec<u8>, ProviderFailure> {
+    let mut bytes = Vec::new();
+    for record in records {
+        let line = serde_json::to_string(record).map_err(|err| {
+            ProviderFailure::unavailable(
+                request_id.to_string(),
+                "canonical_serialize_failed",
+                format!("failed to serialize canonical record: {err}"),
+                false,
+                json!({}),
+            )
+        })?;
+        bytes.extend_from_slice(line.as_bytes());
+        bytes.push(b'\n');
+    }
+    Ok(bytes)
+}
+
+fn parse_canonical_jsonl(
+    request_id: &str,
+    bytes: &[u8],
+) -> Result<Vec<CanonicalRecord>, ProviderFailure> {
+    let text = std::str::from_utf8(bytes).map_err(|err| {
+        ProviderFailure::invalid_request(
+            request_id.to_string(),
+            "invalid_canonical_utf8",
+            format!("canonical transcript is not UTF-8: {err}"),
+        )
+    })?;
+    let mut records = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let line_no = index as u64 + 1;
+        if line.trim().is_empty() {
+            return Err(ProviderFailure::invalid_request(
+                request_id.to_string(),
+                "invalid_canonical_transcript",
+                "blank line in canonical JSONL",
+            ));
+        }
+        let record: CanonicalRecord = serde_json::from_str(line).map_err(|err| {
+            ProviderFailure::invalid_request(
+                request_id.to_string(),
+                "invalid_canonical_transcript",
+                format!("malformed canonical JSONL line {line_no}: {err}"),
+            )
+        })?;
+        validate_canonical_record_shape(request_id, line_no, &record)?;
+        records.push(record);
+    }
+    if records.is_empty() {
+        return Err(ProviderFailure::invalid_request(
+            request_id.to_string(),
+            "invalid_canonical_transcript",
+            "empty canonical transcript",
+        ));
+    }
+    if records.iter().all(|record| record.unsupported_record) {
+        return Err(ProviderFailure::invalid_request(
+            request_id.to_string(),
+            "invalid_canonical_transcript",
+            "canonical transcript has no replaceable records",
+        ));
+    }
+    Ok(records)
+}
+
+fn validate_canonical_record_shape(
+    request_id: &str,
+    line: u64,
+    record: &CanonicalRecord,
+) -> Result<(), ProviderFailure> {
+    if record.session_id.is_empty()
+        || record.provider_name.is_empty()
+        || record.turn_id.is_empty()
+        || record.timestamp.is_empty()
+        || (!record.unsupported_record && !matches!(record.role.as_str(), "user" | "assistant"))
+    {
+        return Err(ProviderFailure::invalid_request(
+            request_id.to_string(),
+            "invalid_canonical_transcript",
+            format!("canonical record line {line} is missing required fields"),
+        ));
+    }
+    DateTime::parse_from_rfc3339(&record.timestamp).map_err(|err| {
+        ProviderFailure::invalid_request(
+            request_id.to_string(),
+            "invalid_canonical_transcript",
+            format!("invalid canonical timestamp on line {line}: {err}"),
+        )
+    })?;
+    Ok(())
+}
+
+fn validate_replacement_records(
+    request_id: &str,
+    records: &[CanonicalRecord],
+    session_id: &str,
+    provider_name: &str,
+) -> Result<(), ProviderFailure> {
+    for (index, record) in records.iter().enumerate() {
+        if record.session_id != session_id || record.provider_name != provider_name {
+            return Err(ProviderFailure::invalid_request(
+                request_id.to_string(),
+                "replacement_target_mismatch",
+                format!(
+                    "canonical record line {} does not match target session/provider",
+                    index + 1
+                ),
+            ));
+        }
+        if record.unsupported_record {
+            return Err(ProviderFailure::invalid_request(
+                request_id.to_string(),
+                "replacement_unsupported_record",
+                "unsupported canonical records cannot be rendered into Claude storage",
+            ));
+        }
+        for chunk in &record.content {
+            if chunk.text.is_none() {
+                return Err(ProviderFailure::invalid_request(
+                    request_id.to_string(),
+                    "replacement_unsupported_content",
+                    format!(
+                        "content chunk type {} cannot be rendered without text",
+                        chunk.chunk_type
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn render_claude_records(
+    request_id: &str,
+    records: &[CanonicalRecord],
+) -> Result<Vec<u8>, ProviderFailure> {
+    let mut bytes = Vec::new();
+    for record in records {
+        let content = record
+            .content
+            .iter()
+            .map(|chunk| json!({ "type": chunk.chunk_type, "text": chunk.text.as_deref().unwrap_or("") }))
+            .collect::<Vec<_>>();
+        let line = json!({
+            "type": record.role,
+            "uuid": record.turn_id,
+            "sessionId": record.session_id,
+            "timestamp": record.timestamp,
+            "message": {
+                "role": record.role,
+                "content": content,
+            },
+        });
+        let line = serde_json::to_string(&line).map_err(|err| {
+            ProviderFailure::unavailable(
+                request_id.to_string(),
+                "render_failed",
+                format!("failed to render Claude transcript line: {err}"),
+                false,
+                json!({}),
+            )
+        })?;
+        bytes.extend_from_slice(line.as_bytes());
+        bytes.push(b'\n');
+    }
+    Ok(bytes)
+}
+
+fn canonical_semantics_equal(left: &[CanonicalRecord], right: &[CanonicalRecord]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.session_id == right.session_id
+                && left.provider_name == right.provider_name
+                && left.turn_id == right.turn_id
+                && left.role == right.role
+                && left.timestamp == right.timestamp
+                && left.unsupported_record == right.unsupported_record
+                && content_chunks_equal(&left.content, &right.content)
+        })
+}
+
+fn content_chunks_equal(left: &[ContentChunk], right: &[ContentChunk]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| left.chunk_type == right.chunk_type && left.text == right.text)
+}
+
+fn atomic_replace_file(request_id: &str, path: &Path, bytes: &[u8]) -> Result<(), ProviderFailure> {
+    let parent = path.parent().ok_or_else(|| {
+        ProviderFailure::unavailable(
+            request_id.to_string(),
+            "replace_path_invalid",
+            "transcript path has no parent directory",
+            false,
+            json!({ "path": path.display().to_string() }),
+        )
+    })?;
+    let tmp_path = path.with_extension(format!("jsonl.tmp-session-replace-{}", now_unix_ms()));
+    {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+            .map_err(|err| {
+                ProviderFailure::unavailable(
+                    request_id.to_string(),
+                    "replace_tmp_write_failed",
+                    format!(
+                        "failed to create replacement temp file {}: {err}",
+                        tmp_path.display()
+                    ),
+                    false,
+                    json!({ "path": tmp_path.display().to_string() }),
+                )
+            })?;
+        file.write_all(bytes).map_err(|err| {
+            ProviderFailure::unavailable(
+                request_id.to_string(),
+                "replace_tmp_write_failed",
+                format!(
+                    "failed to write replacement temp file {}: {err}",
+                    tmp_path.display()
+                ),
+                false,
+                json!({ "path": tmp_path.display().to_string() }),
+            )
+        })?;
+        file.sync_all().map_err(|err| {
+            ProviderFailure::unavailable(
+                request_id.to_string(),
+                "replace_tmp_sync_failed",
+                format!(
+                    "failed to sync replacement temp file {}: {err}",
+                    tmp_path.display()
+                ),
+                false,
+                json!({ "path": tmp_path.display().to_string() }),
+            )
+        })?;
+    }
+    if let Err(err) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(ProviderFailure::unavailable(
+            request_id.to_string(),
+            "replace_conflict",
+            format!(
+                "failed to atomically replace transcript {}: {err}",
+                path.display()
+            ),
+            true,
+            json!({ "path": path.display().to_string() }),
+        ));
+    }
+    if let Ok(dir) = File::open(parent) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
+fn session_artifact(path: &Path, sha256: &str) -> Value {
+    json!({
+        "kind": "file",
+        "path": path.display().to_string(),
+        "sha256": sha256,
+    })
+}
+
+fn session_context_string(params: &SessionParams, key: &str) -> Option<String> {
+    params
+        .context
+        .as_ref()
+        .and_then(|value| nested_context_value(value, key))
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 fn legacy_session_quota_settings(
@@ -1866,6 +3317,11 @@ fn encode_base64(bytes: &[u8]) -> String {
     encoded
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
     let clean = input
         .bytes()
@@ -1934,7 +3390,7 @@ pub fn describe_result() -> Value {
             "launch": true,
             "policy": true,
             "quota": true,
-            "session": false,
+            "session": true,
             "terminal": true,
             "rotation": false,
             "discovery": false,
@@ -2200,7 +3656,7 @@ mod tests {
     fn unsupported_future_capability_uses_contract_error() {
         let args = vec![
             "agent-runner-claude".to_string(),
-            "session.read_turns".to_string(),
+            "rotation.assess".to_string(),
         ];
         let output = handle_invocation(&args, &request(json!({})));
         assert_eq!(output.exit_code, 3);

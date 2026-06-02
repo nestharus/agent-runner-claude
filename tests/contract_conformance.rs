@@ -1,6 +1,8 @@
 use jsonschema::{Draft, JSONSchema};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 const CONTRACT: &str = "oulipoly.provider/v1";
@@ -76,6 +78,7 @@ fn compile_contract_ref(schema_file: &str, def_name: &str) -> JSONSchema {
         "terminal.schema.json" => include_str!("../contract/v1/terminal.schema.json"),
         "quota.schema.json" => include_str!("../contract/v1/quota.schema.json"),
         "launch.schema.json" => include_str!("../contract/v1/launch.schema.json"),
+        "session.schema.json" => include_str!("../contract/v1/session.schema.json"),
         "common.schema.json" => include_str!("../contract/v1/common.schema.json"),
         other => panic!("unhandled schema file: {other}"),
     };
@@ -146,11 +149,10 @@ fn describe_response_conforms_to_contract() {
     assert_eq!(result["provider_id"], "claude");
     assert_eq!(result["display_name"], "Claude Code");
     assert_eq!(result["settings_schema_id"], "claude.settings/v1");
-    for key in ["launch", "policy", "terminal", "quota"] {
+    for key in ["launch", "policy", "terminal", "quota", "session"] {
         assert_eq!(result["capabilities"][key], true, "capability {key}");
     }
     for key in [
-        "session",
         "rotation",
         "discovery",
         "settings",
@@ -201,12 +203,353 @@ fn unknown_schema_returns_contract_error_envelope() {
 
 #[test]
 fn later_capability_returns_contract_error_envelope() {
-    let output = invoke("session.read_turns", json!({}));
+    let output = invoke("rotation.assess", json!({}));
     assert_eq!(output.status.code(), Some(3));
     let response = json_stdout(&output);
     let schema = compile_contract_ref("common.schema.json", "ErrorResponseEnvelope");
     assert_valid(&schema, &response);
     assert_eq!(response["error"]["code"], "capability_not_implemented");
+}
+
+fn temp_session_root(label: &str) -> PathBuf {
+    let root = temp_config_root(label);
+    let project = root.join("-tmp-workspace");
+    std::fs::create_dir_all(&project).unwrap();
+    root
+}
+
+fn session_context(projects_dir: &Path) -> Value {
+    json!({
+        "session_storage": {
+            "kind": "claude_code",
+            "projects_dir": projects_dir.display().to_string()
+        },
+        "provider_name": "claude-primary"
+    })
+}
+
+fn write_claude_transcript(projects_dir: &Path, session_id: &str) -> PathBuf {
+    let path = projects_dir
+        .join("-tmp-workspace")
+        .join(format!("{session_id}.jsonl"));
+    std::fs::write(
+        &path,
+        format!(
+            "{}\n{}\n",
+            json!({
+                "type": "user",
+                "uuid": "turn-user-1",
+                "sessionId": session_id,
+                "timestamp": "2026-06-02T12:00:00Z",
+                "message": { "role": "user", "content": [{ "type": "input_text", "text": "hello" }] }
+            }),
+            json!({
+                "type": "assistant",
+                "uuid": "turn-assistant-1",
+                "sessionId": session_id,
+                "timestamp": "2026-06-02T12:00:01Z",
+                "parentUuid": "turn-user-1",
+                "message": { "role": "assistant", "content": [{ "type": "output_text", "text": "world" }] }
+            })
+        ),
+    )
+    .unwrap();
+    path
+}
+
+fn session_params(projects_dir: &Path, session_id: &str) -> Value {
+    json!({
+        "settings_id": "claude-primary",
+        "session_id": session_id,
+        "context": session_context(projects_dir)
+    })
+}
+
+fn decode_b64(data: &str) -> Vec<u8> {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = Vec::new();
+    let bytes = data.as_bytes();
+    for chunk in bytes.chunks(4) {
+        let mut values = [0_u8; 4];
+        for (idx, byte) in chunk.iter().enumerate() {
+            values[idx] = if *byte == b'=' {
+                0
+            } else {
+                TABLE.iter().position(|value| value == byte).unwrap() as u8
+            };
+        }
+        out.push((values[0] << 2) | (values[1] >> 4));
+        if chunk.get(2) != Some(&b'=') {
+            out.push((values[1] << 4) | (values[2] >> 2));
+        }
+        if chunk.get(3) != Some(&b'=') {
+            out.push((values[2] << 6) | values[3]);
+        }
+    }
+    out
+}
+
+fn encode_b64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::new();
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+        encoded.push(TABLE[(b0 >> 2) as usize] as char);
+        encoded.push(TABLE[(((b0 & 0b0000_0011) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            encoded.push(TABLE[(((b1 & 0b0000_1111) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            encoded.push('=');
+        }
+        if chunk.len() > 2 {
+            encoded.push(TABLE[(b2 & 0b0011_1111) as usize] as char);
+        } else {
+            encoded.push('=');
+        }
+    }
+    encoded
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[test]
+fn session_locate_transcript_finds_claude_code_file_by_session_filename() {
+    let projects_dir = temp_session_root("session-locate");
+    let transcript = write_claude_transcript(&projects_dir, "sess-locate");
+    let output = invoke(
+        "session.locate_transcript",
+        session_params(&projects_dir, "sess-locate"),
+    );
+    assert!(output.status.success());
+    let response = json_stdout(&output);
+    let schema = compile_contract_ref("session.schema.json", "SessionLocateTranscriptResponse");
+    assert_valid(&schema, &response);
+    assert_eq!(response["result"]["located"], true);
+    assert_eq!(response["result"]["format_id"], "claude_code");
+    assert_eq!(
+        response["result"]["path"],
+        transcript.canonicalize().unwrap().display().to_string()
+    );
+    let _ = std::fs::remove_dir_all(projects_dir);
+}
+
+#[test]
+fn session_locate_transcript_falls_back_to_content_session_id() {
+    let projects_dir = temp_session_root("session-locate-content");
+    let path = projects_dir
+        .join("-tmp-workspace")
+        .join("renamed-session.jsonl");
+    std::fs::write(
+        &path,
+        format!(
+            "{}\n",
+            json!({
+                "type": "user",
+                "uuid": "turn-user-1",
+                "sessionId": "sess-content",
+                "timestamp": "2026-06-02T12:00:00Z",
+                "message": "hello"
+            })
+        ),
+    )
+    .unwrap();
+    let output = invoke(
+        "session.locate_transcript",
+        session_params(&projects_dir, "sess-content"),
+    );
+    assert!(output.status.success());
+    let response = json_stdout(&output);
+    assert_eq!(
+        response["result"]["path"],
+        path.canonicalize().unwrap().display().to_string()
+    );
+    let _ = std::fs::remove_dir_all(projects_dir);
+}
+
+#[test]
+fn session_read_turns_returns_stable_turns_and_zero_turn_completion() {
+    let projects_dir = temp_session_root("session-read-turns");
+    write_claude_transcript(&projects_dir, "sess-turns");
+    let output = invoke(
+        "session.read_turns",
+        session_params(&projects_dir, "sess-turns"),
+    );
+    assert!(output.status.success());
+    let response = json_stdout(&output);
+    let schema = compile_contract_ref("session.schema.json", "SessionReadTurnsResponse");
+    assert_valid(&schema, &response);
+    assert_eq!(response["result"]["complete"], true);
+    assert_eq!(response["result"]["turn_count"], 2);
+    assert_eq!(response["result"]["turns"][0]["turn_id"], "turn-user-1");
+    assert_eq!(response["result"]["turns"][0]["body"][0]["text"], "hello");
+
+    let empty_path = projects_dir
+        .join("-tmp-workspace")
+        .join("empty-session.jsonl");
+    std::fs::write(&empty_path, "").unwrap();
+    let output = invoke(
+        "session.read_turns",
+        session_params(&projects_dir, "empty-session"),
+    );
+    assert!(output.status.success());
+    let response = json_stdout(&output);
+    assert_eq!(response["result"]["turn_count"], 0);
+    assert_eq!(response["result"]["complete"], true);
+    let _ = std::fs::remove_dir_all(projects_dir);
+}
+
+#[test]
+fn session_export_returns_canonical_jsonl_bytes_and_hash() {
+    let projects_dir = temp_session_root("session-export");
+    write_claude_transcript(&projects_dir, "sess-export");
+    let output = invoke(
+        "session.export",
+        session_params(&projects_dir, "sess-export"),
+    );
+    assert!(output.status.success());
+    let response = json_stdout(&output);
+    let schema = compile_contract_ref("session.schema.json", "SessionExportResponse");
+    assert_valid(&schema, &response);
+    let bytes = decode_b64(response["result"]["data_base64"].as_str().unwrap());
+    let text = String::from_utf8(bytes.clone()).unwrap();
+    let lines = text.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 2);
+    let first: Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(first["session_id"], "sess-export");
+    assert_eq!(first["provider_name"], "claude-primary");
+    assert_eq!(first["content"][0]["type"], "text");
+    assert_eq!(response["result"]["turn_count"], 2);
+    assert_eq!(response["result"]["sha256"], sha256_hex(&bytes));
+    let _ = std::fs::remove_dir_all(projects_dir);
+}
+
+#[test]
+fn session_replace_validates_preimage_and_writes_claude_storage_atomically() {
+    let projects_dir = temp_session_root("session-replace");
+    let transcript = write_claude_transcript(&projects_dir, "sess-replace");
+    let export = json_stdout(&invoke(
+        "session.export",
+        session_params(&projects_dir, "sess-replace"),
+    ));
+    let mut records = String::from_utf8(decode_b64(
+        export["result"]["data_base64"].as_str().unwrap(),
+    ))
+    .unwrap()
+    .lines()
+    .map(|line| serde_json::from_str::<Value>(line).unwrap())
+    .collect::<Vec<_>>();
+    records[0]["content"][0]["text"] = json!("replacement user body");
+    records[1]["content"][0]["text"] = json!("replacement assistant body");
+    let replacement = records
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let replacement_bytes = replacement.as_bytes();
+    let output = invoke(
+        "session.replace",
+        json!({
+            "settings_id": "claude-primary",
+            "session_id": "sess-replace",
+            "provider_name": "claude-primary",
+            "canonical_format": "oulipoly.canonical_transcript/v1",
+            "data_base64": encode_b64(replacement_bytes),
+            "preimage_sha256": export["result"]["sha256"],
+            "context": session_context(&projects_dir)
+        }),
+    );
+    assert!(output.status.success());
+    let response = json_stdout(&output);
+    let schema = compile_contract_ref("session.schema.json", "SessionReplaceResponse");
+    assert_valid(&schema, &response);
+    assert_eq!(response["result"]["changed"], true);
+    assert_ne!(
+        response["result"]["postimage_sha256"],
+        sha256_hex(replacement_bytes)
+    );
+    assert_eq!(
+        response["result"]["host_state_plan"]["records_sha256"],
+        sha256_hex(replacement_bytes)
+    );
+    assert_eq!(
+        response["result"]["host_state_plan"]["postimage_sha256"],
+        response["result"]["postimage_sha256"]
+    );
+    let native = std::fs::read_to_string(&transcript).unwrap();
+    assert!(native.contains("replacement user body"));
+    assert!(native.contains("replacement assistant body"));
+
+    let mismatch = invoke(
+        "session.replace",
+        json!({
+            "settings_id": "claude-primary",
+            "session_id": "sess-replace",
+            "provider_name": "claude-primary",
+            "canonical_format": "oulipoly.canonical_transcript/v1",
+            "data_base64": encode_b64(replacement_bytes),
+            "preimage_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+            "context": session_context(&projects_dir)
+        }),
+    );
+    assert_eq!(mismatch.status.code(), Some(1));
+    let response = json_stdout(&mismatch);
+    assert_eq!(response["error"]["code"], "preimage_mismatch");
+    let _ = std::fs::remove_dir_all(projects_dir);
+}
+
+#[test]
+fn session_replace_reports_no_change_for_identical_canonical_input() {
+    let projects_dir = temp_session_root("session-replace-no-change");
+    write_claude_transcript(&projects_dir, "sess-no-change");
+    let export = json_stdout(&invoke(
+        "session.export",
+        session_params(&projects_dir, "sess-no-change"),
+    ));
+    let output = invoke(
+        "session.replace",
+        json!({
+            "settings_id": "claude-primary",
+            "session_id": "sess-no-change",
+            "provider_name": "claude-primary",
+            "canonical_format": "oulipoly.canonical_transcript/v1",
+            "data_base64": export["result"]["data_base64"],
+            "preimage_sha256": export["result"]["sha256"],
+            "context": session_context(&projects_dir)
+        }),
+    );
+    assert!(output.status.success());
+    let response = json_stdout(&output);
+    assert_eq!(response["result"]["changed"], false);
+    assert!(response["result"]["host_state_plan"].is_null());
+    let _ = std::fs::remove_dir_all(projects_dir);
+}
+
+#[test]
+fn session_capture_extracts_stdout_json_event_session_id() {
+    let stdout = br#"{"type":"system","session_id":"stdout-session"}"#;
+    let output = invoke(
+        "session.capture",
+        json!({
+            "settings_id": "claude-primary",
+            "stdout_base64": encode_b64(stdout),
+            "capture": {
+                "kind": "stdout_json_event",
+                "event_type": "system",
+                "event_id_path": "session_id"
+            }
+        }),
+    );
+    assert!(output.status.success());
+    let response = json_stdout(&output);
+    let schema = compile_contract_ref("session.schema.json", "SessionCaptureResponse");
+    assert_valid(&schema, &response);
+    assert_eq!(response["result"]["provider_session_id"], "stdout-session");
 }
 
 #[test]
