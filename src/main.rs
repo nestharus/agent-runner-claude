@@ -8,7 +8,6 @@ fn main() {
     }
 
     let args = std::env::args().collect::<Vec<_>>();
-    let output = agent_runner_claude::handle_invocation(&args, &stdin);
-    print!("{}", output.stdout);
-    std::process::exit(output.exit_code);
+    let exit_code = agent_runner_claude::write_invocation(&args, &stdin, &mut std::io::stdout());
+    std::process::exit(exit_code);
 }

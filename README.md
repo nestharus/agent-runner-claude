@@ -3,15 +3,23 @@
 Standalone Claude provider CLI for the `oulipoly.provider/v1` external provider
 contract.
 
-This foundation slice implements the one-shot invocation convention:
+This provider implements the one-shot invocation convention:
 
 ```text
 agent-runner-claude <subcommand>
 ```
 
-Each subcommand reads one JSON request envelope on stdin and writes one JSON
-response envelope on stdout. This slice implements `describe` and `schema`.
-Later slices will fill the advertised Claude capabilities.
+Each subcommand reads one JSON request envelope on stdin. Non-launch commands
+write one JSON response envelope on stdout. `launch` writes newline-delimited
+JSON events and finishes with an `exit` event.
+
+Implemented commands:
+
+- `describe`
+- `schema`
+- `policy.evaluate`
+- `terminal.classify`
+- `launch`
 
 Example:
 

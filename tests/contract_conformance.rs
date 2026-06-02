@@ -52,6 +52,9 @@ fn compile_contract_ref(schema_file: &str, def_name: &str) -> JSONSchema {
     let schema_text = match schema_file {
         "describe.schema.json" => include_str!("../contract/v1/describe.schema.json"),
         "schema.schema.json" => include_str!("../contract/v1/schema.schema.json"),
+        "policy.schema.json" => include_str!("../contract/v1/policy.schema.json"),
+        "terminal.schema.json" => include_str!("../contract/v1/terminal.schema.json"),
+        "launch.schema.json" => include_str!("../contract/v1/launch.schema.json"),
         "common.schema.json" => include_str!("../contract/v1/common.schema.json"),
         other => panic!("unhandled schema file: {other}"),
     };
@@ -122,12 +125,12 @@ fn describe_response_conforms_to_contract() {
     assert_eq!(result["provider_id"], "claude");
     assert_eq!(result["display_name"], "Claude Code");
     assert_eq!(result["settings_schema_id"], "claude.settings/v1");
+    for key in ["launch", "policy", "terminal"] {
+        assert_eq!(result["capabilities"][key], true, "capability {key}");
+    }
     for key in [
-        "launch",
-        "policy",
         "quota",
         "session",
-        "terminal",
         "rotation",
         "discovery",
         "settings",
@@ -135,7 +138,7 @@ fn describe_response_conforms_to_contract() {
         "setup",
         "migration",
     ] {
-        assert_eq!(result["capabilities"][key], true, "capability {key}");
+        assert_eq!(result["capabilities"][key], false, "capability {key}");
     }
     assert_eq!(result["concurrency"]["safe_for_parallel_invocation"], true);
 }
@@ -178,10 +181,212 @@ fn unknown_schema_returns_contract_error_envelope() {
 
 #[test]
 fn later_capability_returns_contract_error_envelope() {
-    let output = invoke("policy.evaluate", json!({}));
+    let output = invoke("quota.source", json!({}));
     assert_eq!(output.status.code(), Some(3));
     let response = json_stdout(&output);
     let schema = compile_contract_ref("common.schema.json", "ErrorResponseEnvelope");
     assert_valid(&schema, &response);
     assert_eq!(response["error"]["code"], "capability_not_implemented");
+}
+
+#[test]
+fn policy_evaluate_appends_claude_policy_and_reports_diagnostics() {
+    let output = invoke(
+        "policy.evaluate",
+        json!({
+            "settings_id": "claude-primary",
+            "mode": "proxy",
+            "model": {
+                "name": "claude-sonnet",
+                "provider_args": ["--model", "sonnet"],
+                "inputs": { "prompt": "hello", "named": {} }
+            },
+            "launch": {
+                "command": "claude --allowed-tools Bash",
+                "args": ["--tools", "mcp__unsafe"],
+                "prompt_mode": "arg",
+                "invocation_mode": "proxy",
+                "system_prompt_override": "system policy",
+                "tool_restrictions": {
+                    "kind": "claude",
+                    "claude": {
+                        "allowed_tools": ["Bash"],
+                        "disable_slash_commands": true
+                    }
+                }
+            }
+        }),
+    );
+    assert!(output.status.success());
+    let response = json_stdout(&output);
+    let schema = compile_contract_ref("policy.schema.json", "PolicyEvaluateResponse");
+    assert_valid(&schema, &response);
+
+    let result = &response["result"];
+    assert_eq!(result["accepted"], false);
+    assert!(result["argv"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("--append-system-prompt")));
+    assert!(result["argv"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("--allowed-tools")));
+    assert!(result["argv"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("--disable-slash-commands")));
+    assert_eq!(result["prompt"], "hello");
+    let diagnostics = result["diagnostics"].as_array().unwrap();
+    assert!(diagnostics
+        .iter()
+        .any(|item| item["code"] == "duplicate_claude_tool_filter"));
+    assert!(diagnostics
+        .iter()
+        .any(|item| item["code"] == "unsafe_proxy_claude_tools_restrict"));
+}
+
+#[test]
+fn terminal_classify_matches_claude_exit_vocabulary_without_quota_substrings() {
+    let output = invoke(
+        "terminal.classify",
+        json!({
+            "stdout_base64": "",
+            "stderr_base64": "Q2xhdWRlIHVzYWdlIGxpbWl0IHJlYWNoZWQ=",
+            "status": { "kind": "exited", "code": 0 },
+            "observed_at_unix_ms": 1234
+        }),
+    );
+    assert!(output.status.success());
+    let response = json_stdout(&output);
+    let schema = compile_contract_ref("terminal.schema.json", "TerminalClassifyResponse");
+    assert_valid(&schema, &response);
+    assert_eq!(response["result"]["terminal_signal"]["kind"], "clean_exit");
+    assert_eq!(
+        response["result"]["terminal_signal"]["evidence"],
+        "exit_code=0"
+    );
+}
+
+#[test]
+fn launch_stream_preserves_stdout_and_stderr_bytes() {
+    let output = invoke(
+        "launch",
+        json!({
+            "settings_id": "claude-primary",
+            "mode": "headless",
+            "model": {
+                "name": "claude-sonnet",
+                "provider_args": [],
+                "inputs": { "prompt": null, "named": {} }
+            },
+            "argv": [
+                "/bin/sh",
+                "-c",
+                "printf '\\000\\001\\377'; printf 'err\\377\\376' >&2"
+            ],
+            "working_directory": "/tmp",
+            "env": {}
+        }),
+    );
+    assert!(output.status.success());
+    assert!(
+        output.stderr.is_empty(),
+        "launch provider diagnostics must stay off stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let lines = String::from_utf8(output.stdout).unwrap();
+    let events = lines
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let stdout_schema = compile_contract_ref("launch.schema.json", "LaunchStdoutEvent");
+    let stderr_schema = compile_contract_ref("launch.schema.json", "LaunchStderrEvent");
+    let exit_schema = compile_contract_ref("launch.schema.json", "LaunchExitEvent");
+    let stdout = events
+        .iter()
+        .find(|event| event["kind"] == "stdout")
+        .expect("stdout event");
+    let stderr = events
+        .iter()
+        .find(|event| event["kind"] == "stderr")
+        .expect("stderr event");
+    let exit = events.last().expect("exit event");
+    assert_valid(&stdout_schema, stdout);
+    assert_valid(&stderr_schema, stderr);
+    assert_valid(&exit_schema, exit);
+
+    assert_eq!(stdout["data_base64"], "AAH/");
+    assert_eq!(stderr["data_base64"], "ZXJy//4=");
+    assert_eq!(exit["status"], json!({ "kind": "exited", "code": 0 }));
+    assert_eq!(exit["terminal_signal"]["kind"], "clean_exit");
+}
+
+#[test]
+fn launch_stream_reports_session_marker_and_nonzero_exit() {
+    let output = invoke(
+        "launch",
+        json!({
+            "settings_id": "claude-primary",
+            "mode": "headless",
+            "model": {
+                "name": "claude-sonnet",
+                "provider_args": [],
+                "inputs": { "prompt": null, "named": {} }
+            },
+            "argv": ["/bin/sh", "-c", "exit 7"],
+            "working_directory": "/tmp",
+            "env": {},
+            "session": { "provider_session_id": "known-session" }
+        }),
+    );
+    assert!(output.status.success());
+    let lines = String::from_utf8(output.stdout).unwrap();
+    let events = lines
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+
+    let marker_schema = compile_contract_ref("launch.schema.json", "LaunchMarkerEvent");
+    let exit_schema = compile_contract_ref("launch.schema.json", "LaunchExitEvent");
+    assert_valid(&marker_schema, &events[0]);
+    assert_valid(&exit_schema, &events[1]);
+    assert_eq!(events[0]["kind"], "marker");
+    assert_eq!(events[0]["name"], "provider_session_known");
+    assert_eq!(events[1]["status"], json!({ "kind": "exited", "code": 7 }));
+    assert_eq!(events[1]["terminal_signal"]["kind"], "nonzero_exit");
+    assert_eq!(events[1]["session"]["provider_session_id"], "known-session");
+}
+
+#[test]
+fn launch_stream_rejects_invalid_stdin_base64_before_spawn() {
+    let output = invoke(
+        "launch",
+        json!({
+            "settings_id": "claude-primary",
+            "mode": "headless",
+            "model": {
+                "name": "claude-sonnet",
+                "provider_args": [],
+                "inputs": { "prompt": null, "named": {} }
+            },
+            "argv": ["/bin/sh", "-c", "printf should-not-run"],
+            "working_directory": "/tmp",
+            "env": {},
+            "stdin": { "encoding": "base64", "data": "@@not-base64@@" }
+        }),
+    );
+    assert!(output.status.success());
+    let lines = String::from_utf8(output.stdout).unwrap();
+    let events = lines
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+
+    let exit_schema = compile_contract_ref("launch.schema.json", "LaunchExitEvent");
+    assert_eq!(events.len(), 1);
+    assert_valid(&exit_schema, &events[0]);
+    assert_eq!(events[0]["status"]["kind"], "spawn_error");
+    assert_eq!(events[0]["terminal_signal"]["kind"], "spawn_error");
 }
