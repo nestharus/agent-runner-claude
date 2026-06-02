@@ -6,6 +6,10 @@ use std::process::{Command, Output, Stdio};
 const CONTRACT: &str = "oulipoly.provider/v1";
 
 fn invoke(subcommand: &str, params: Value) -> Output {
+    invoke_with_host(subcommand, params, json!({}))
+}
+
+fn invoke_with_host(subcommand: &str, params: Value, host_overrides: Value) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_agent-runner-claude"))
         .arg(subcommand)
         .stdin(Stdio::piped())
@@ -13,19 +17,25 @@ fn invoke(subcommand: &str, params: Value) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
+    let mut host = json!({
+        "app": "oulipoly-agent-runner",
+        "app_version": "0.0.0",
+        "platform": "linux-x86_64",
+        "working_directory": "/tmp",
+        "config_root": "/tmp/config",
+        "data_root": "/tmp/data",
+        "env": { "TERM": "xterm-256color" }
+    });
+    if let (Some(host), Some(overrides)) = (host.as_object_mut(), host_overrides.as_object()) {
+        for (key, value) in overrides {
+            host.insert(key.clone(), value.clone());
+        }
+    }
     let request = json!({
         "contract": CONTRACT,
         "request_id": format!("req-{subcommand}"),
         "provider_instance_id": "claude-primary",
-        "host": {
-            "app": "oulipoly-agent-runner",
-            "app_version": "0.0.0",
-            "platform": "linux-x86_64",
-            "working_directory": "/tmp",
-            "config_root": "/tmp/config",
-            "data_root": "/tmp/data",
-            "env": { "TERM": "xterm-256color" }
-        },
+        "host": host,
         "params": params
     });
     child
@@ -35,6 +45,16 @@ fn invoke(subcommand: &str, params: Value) -> Output {
         .write_all(request.to_string().as_bytes())
         .unwrap();
     child.wait_with_output().unwrap()
+}
+
+fn temp_config_root(label: &str) -> std::path::PathBuf {
+    let root = std::env::temp_dir().join(format!(
+        "agent-runner-claude-{label}-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    root
 }
 
 fn json_stdout(output: &Output) -> Value {
@@ -54,6 +74,7 @@ fn compile_contract_ref(schema_file: &str, def_name: &str) -> JSONSchema {
         "schema.schema.json" => include_str!("../contract/v1/schema.schema.json"),
         "policy.schema.json" => include_str!("../contract/v1/policy.schema.json"),
         "terminal.schema.json" => include_str!("../contract/v1/terminal.schema.json"),
+        "quota.schema.json" => include_str!("../contract/v1/quota.schema.json"),
         "launch.schema.json" => include_str!("../contract/v1/launch.schema.json"),
         "common.schema.json" => include_str!("../contract/v1/common.schema.json"),
         other => panic!("unhandled schema file: {other}"),
@@ -125,11 +146,10 @@ fn describe_response_conforms_to_contract() {
     assert_eq!(result["provider_id"], "claude");
     assert_eq!(result["display_name"], "Claude Code");
     assert_eq!(result["settings_schema_id"], "claude.settings/v1");
-    for key in ["launch", "policy", "terminal"] {
+    for key in ["launch", "policy", "terminal", "quota"] {
         assert_eq!(result["capabilities"][key], true, "capability {key}");
     }
     for key in [
-        "quota",
         "session",
         "rotation",
         "discovery",
@@ -181,12 +201,534 @@ fn unknown_schema_returns_contract_error_envelope() {
 
 #[test]
 fn later_capability_returns_contract_error_envelope() {
-    let output = invoke("quota.source", json!({}));
+    let output = invoke("session.read_turns", json!({}));
     assert_eq!(output.status.code(), Some(3));
     let response = json_stdout(&output);
     let schema = compile_contract_ref("common.schema.json", "ErrorResponseEnvelope");
     assert_valid(&schema, &response);
     assert_eq!(response["error"]["code"], "capability_not_implemented");
+}
+
+#[test]
+fn quota_source_reports_fresh_cached_script_without_running_probe() {
+    let output = invoke(
+        "quota.source",
+        json!({
+            "settings_id": "claude-primary",
+            "model_name": "claude-sonnet",
+            "context": {
+                "settings": {
+                    "quota_script": "exit 99"
+                },
+                "now_unix_ms": 1779991000200u64,
+                "cached_checked_at_unix_ms": 1779990990200u64,
+                "cached_windows": [
+                    {
+                        "name": "weekly",
+                        "remaining_ratio": 0.42,
+                        "resets_at_unix_ms": 1780595800200u64
+                    }
+                ]
+            }
+        }),
+    );
+    assert!(output.status.success());
+    let response = json_stdout(&output);
+    let schema = compile_contract_ref("quota.schema.json", "QuotaSourceResponse");
+    assert_valid(&schema, &response);
+
+    assert_eq!(response["result"]["has_source"], true);
+    assert_eq!(
+        response["result"]["source_id"],
+        "claude:claude-primary:quota_script"
+    );
+    assert_eq!(response["result"]["freshness"], "fresh");
+}
+
+#[test]
+fn quota_source_rejects_non_object_context() {
+    let output = invoke(
+        "quota.source",
+        json!({
+            "settings_id": "claude-primary",
+            "context": []
+        }),
+    );
+    assert_eq!(output.status.code(), Some(2));
+    let response = json_stdout(&output);
+    let schema = compile_contract_ref("common.schema.json", "ErrorResponseEnvelope");
+    assert_valid(&schema, &response);
+    assert_eq!(response["error"]["category"], "invalid_request");
+    assert_eq!(response["error"]["code"], "invalid_quota_context");
+}
+
+#[test]
+fn quota_source_uses_provider_toml_for_runtime_request_shape() {
+    let config_root = temp_config_root("quota-source");
+    std::fs::write(
+        config_root.join("providers.toml"),
+        r#"[claude-primary]
+quota_script = "printf '%s' '{\"windows\":[]}'"
+"#,
+    )
+    .unwrap();
+    let output = invoke_with_host(
+        "quota.source",
+        json!({
+            "settings_id": "provider-a-test",
+            "model_name": "claude-sonnet",
+            "context": {
+                "provider_name": "claude-primary"
+            }
+        }),
+        json!({ "config_root": config_root.display().to_string() }),
+    );
+    assert!(output.status.success());
+    let response = json_stdout(&output);
+    let schema = compile_contract_ref("quota.schema.json", "QuotaSourceResponse");
+    assert_valid(&schema, &response);
+    assert_eq!(response["result"]["has_source"], true);
+    assert_eq!(response["result"]["freshness"], "probe_required");
+    let _ = std::fs::remove_dir_all(config_root);
+}
+
+#[test]
+fn quota_source_derives_anthropic_script_from_provider_session_storage() {
+    let config_root = temp_config_root("quota-derived-provider-storage");
+    std::fs::write(
+        config_root.join("providers.toml"),
+        r#"[claude-primary.session_storage]
+kind = "script"
+cwd_script = "claude-code-cwd /home/test/.claude/projects"
+"#,
+    )
+    .unwrap();
+    let output = invoke_with_host(
+        "quota.source",
+        json!({
+            "settings_id": "provider-a-test",
+            "model_name": "claude-sonnet",
+            "context": {
+                "provider_name": "claude-primary"
+            }
+        }),
+        json!({ "config_root": config_root.display().to_string() }),
+    );
+    assert!(output.status.success());
+    let response = json_stdout(&output);
+    let schema = compile_contract_ref("quota.schema.json", "QuotaSourceResponse");
+    assert_valid(&schema, &response);
+    assert_eq!(response["result"]["has_source"], true);
+    let _ = std::fs::remove_dir_all(config_root);
+}
+
+#[test]
+fn quota_source_merges_top_level_auth_with_nested_derived_storage() {
+    let config_root = temp_config_root("quota-auth-plus-derived-provider-storage");
+    std::fs::write(
+        config_root.join("providers.toml"),
+        r#"[claude-primary]
+auth_refresh_command = "claude auth status"
+
+[claude-primary.session_storage]
+kind = "script"
+cwd_script = "claude-code-cwd /home/test/.claude/projects"
+"#,
+    )
+    .unwrap();
+    let output = invoke_with_host(
+        "quota.source",
+        json!({
+            "settings_id": "provider-a-test",
+            "model_name": "claude-sonnet",
+            "context": {
+                "provider_name": "claude-primary"
+            }
+        }),
+        json!({ "config_root": config_root.display().to_string() }),
+    );
+    assert!(output.status.success());
+    let response = json_stdout(&output);
+    let schema = compile_contract_ref("quota.schema.json", "QuotaSourceResponse");
+    assert_valid(&schema, &response);
+    assert_eq!(response["result"]["has_source"], true);
+    let _ = std::fs::remove_dir_all(config_root);
+}
+
+#[test]
+fn quota_source_derives_from_claude_code_storage_kind() {
+    let config_root = temp_config_root("quota-claude-code-storage-kind");
+    std::fs::write(
+        config_root.join("providers.toml"),
+        r#"[claude-primary.session_storage]
+kind = "claude_code"
+projects_dir = "/home/test/.claude/projects"
+"#,
+    )
+    .unwrap();
+    let output = invoke_with_host(
+        "quota.source",
+        json!({
+            "settings_id": "provider-a-test",
+            "model_name": "claude-sonnet",
+            "context": {
+                "provider_name": "claude-primary"
+            }
+        }),
+        json!({ "config_root": config_root.display().to_string() }),
+    );
+    assert!(output.status.success());
+    let response = json_stdout(&output);
+    let schema = compile_contract_ref("quota.schema.json", "QuotaSourceResponse");
+    assert_valid(&schema, &response);
+    assert_eq!(response["result"]["has_source"], true);
+    let _ = std::fs::remove_dir_all(config_root);
+}
+
+#[test]
+fn quota_source_ignores_blank_quota_script_and_falls_back_to_storage() {
+    let config_root = temp_config_root("quota-blank-script-fallback");
+    std::fs::write(
+        config_root.join("providers.toml"),
+        r#"[claude-primary]
+quota_script = "   "
+
+[claude-primary.session_storage]
+kind = "script"
+cwd_script = "claude-code-cwd /home/test/.claude/projects"
+"#,
+    )
+    .unwrap();
+    let output = invoke_with_host(
+        "quota.source",
+        json!({
+            "settings_id": "provider-a-test",
+            "model_name": "claude-sonnet",
+            "context": {
+                "provider_name": "claude-primary"
+            }
+        }),
+        json!({ "config_root": config_root.display().to_string() }),
+    );
+    assert!(output.status.success());
+    let response = json_stdout(&output);
+    let schema = compile_contract_ref("quota.schema.json", "QuotaSourceResponse");
+    assert_valid(&schema, &response);
+    assert_eq!(response["result"]["has_source"], true);
+    let _ = std::fs::remove_dir_all(config_root);
+}
+
+#[test]
+fn quota_source_accepts_standard_toml_literal_strings_and_quoted_tables() {
+    let config_root = temp_config_root("quota-standard-toml-forms");
+    std::fs::write(
+        config_root.join("providers.toml"),
+        r#"["claude.primary"]
+quota_script = 'printf "%s" "{\"windows\":[]}"'
+"#,
+    )
+    .unwrap();
+    let output = invoke_with_host(
+        "quota.source",
+        json!({
+            "settings_id": "provider-a-test",
+            "model_name": "claude-sonnet",
+            "context": {
+                "provider_name": "claude.primary"
+            }
+        }),
+        json!({ "config_root": config_root.display().to_string() }),
+    );
+    assert!(output.status.success());
+    let response = json_stdout(&output);
+    let schema = compile_contract_ref("quota.schema.json", "QuotaSourceResponse");
+    assert_valid(&schema, &response);
+    assert_eq!(response["result"]["has_source"], true);
+    let _ = std::fs::remove_dir_all(config_root);
+}
+
+#[test]
+fn quota_refresh_auth_uses_top_level_auth_with_nested_derived_storage() {
+    let config_root = temp_config_root("quota-refresh-auth-plus-derived-storage");
+    let marker = config_root.join("refresh-marker");
+    std::fs::write(
+        config_root.join("providers.toml"),
+        format!(
+            "[claude-primary]\nauth_refresh_command = \"printf refreshed > {}\"\n\n[claude-primary.session_storage]\nkind = \"script\"\ncwd_script = \"claude-code-cwd /home/test/.claude/projects\"\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    let output = invoke_with_host(
+        "quota.refresh_auth",
+        json!({
+            "settings_id": "provider-a-test",
+            "force": false
+        }),
+        json!({ "config_root": config_root.display().to_string() }),
+    );
+    assert!(output.status.success());
+    let response = json_stdout(&output);
+    let schema = compile_contract_ref("quota.schema.json", "QuotaRefreshAuthResponse");
+    assert_valid(&schema, &response);
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "refreshed");
+    let _ = std::fs::remove_dir_all(config_root);
+}
+
+#[test]
+fn quota_source_derives_anthropic_script_from_legacy_sessions_toml() {
+    let config_root = temp_config_root("quota-derived-session-storage");
+    std::fs::write(config_root.join("providers.toml"), "[claude-primary]\n").unwrap();
+    std::fs::write(
+        config_root.join("sessions.toml"),
+        r#"[claude-primary]
+turn_script = "claude-code-turns /home/test/.claude/projects"
+"#,
+    )
+    .unwrap();
+    let output = invoke_with_host(
+        "quota.source",
+        json!({
+            "settings_id": "provider-a-test",
+            "model_name": "claude-sonnet",
+            "context": {
+                "provider_name": "claude-primary"
+            }
+        }),
+        json!({ "config_root": config_root.display().to_string() }),
+    );
+    assert!(output.status.success());
+    let response = json_stdout(&output);
+    let schema = compile_contract_ref("quota.schema.json", "QuotaSourceResponse");
+    assert_valid(&schema, &response);
+    assert_eq!(response["result"]["has_source"], true);
+    let _ = std::fs::remove_dir_all(config_root);
+}
+
+#[test]
+fn quota_probe_maps_anthropic_usage_windows_to_remaining_ratio_contract() {
+    let output = invoke(
+        "quota.probe",
+        json!({
+            "settings_id": "claude-primary",
+            "context": {
+                "quota_script": "printf '%s' '{\"windows\":[{\"label\":\"weekly\",\"used_percent\":45,\"resets_at\":\"2026-04-17T15:00:00Z\"},{\"label\":\"5h-burst\",\"used_percent\":23,\"resets_at\":\"2026-04-23T19:00:00Z\"}]}'",
+                "now_unix_ms": 1779991000200u64
+            }
+        }),
+    );
+    assert!(output.status.success());
+    let response = json_stdout(&output);
+    let schema = compile_contract_ref("quota.schema.json", "QuotaProbeResponse");
+    assert_valid(&schema, &response);
+
+    let result = &response["result"];
+    assert_eq!(result["available"], true);
+    assert_eq!(result["checked_at_unix_ms"], 1779991000200u64);
+    let windows = result["windows"].as_array().unwrap();
+    assert_eq!(windows.len(), 2);
+    assert_eq!(windows[0]["name"], "weekly");
+    assert!((windows[0]["remaining_ratio"].as_f64().unwrap() - 0.55).abs() < 1e-9);
+    assert_eq!(windows[0]["resets_at_unix_ms"], 1776438000000u64);
+    assert_eq!(windows[1]["name"], "5h-burst");
+    assert!((windows[1]["remaining_ratio"].as_f64().unwrap() - 0.77).abs() < 1e-9);
+}
+
+#[test]
+fn quota_probe_uses_provider_toml_for_runtime_request_shape() {
+    let config_root = temp_config_root("quota-probe");
+    std::fs::write(
+        config_root.join("providers.toml"),
+        r#"[claude-primary]
+quota_script = "printf '%s' '{\"used_percent\":12,\"resets_at\":\"2026-04-23T19:00:00Z\"}'"
+"#,
+    )
+    .unwrap();
+    let output = invoke_with_host(
+        "quota.probe",
+        json!({
+            "settings_id": "provider-a-test",
+            "model_name": "claude-sonnet",
+            "context": {
+                "provider_name": "claude-primary",
+                "now_unix_ms": 1779991000200u64
+            }
+        }),
+        json!({ "config_root": config_root.display().to_string() }),
+    );
+    assert!(output.status.success());
+    let response = json_stdout(&output);
+    let schema = compile_contract_ref("quota.schema.json", "QuotaProbeResponse");
+    assert_valid(&schema, &response);
+    let windows = response["result"]["windows"].as_array().unwrap();
+    assert_eq!(windows.len(), 1);
+    assert!((windows[0]["remaining_ratio"].as_f64().unwrap() - 0.88).abs() < 1e-9);
+    let _ = std::fs::remove_dir_all(config_root);
+}
+
+#[test]
+fn quota_probe_rejects_empty_windows_after_prior_populated_data() {
+    let output = invoke(
+        "quota.probe",
+        json!({
+            "settings_id": "claude-primary",
+            "context": {
+                "quota_script": "printf '%s' '{\"windows\":[]}'",
+                "had_prior_windows": true
+            }
+        }),
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let response = json_stdout(&output);
+    let schema = compile_contract_ref("common.schema.json", "ErrorResponseEnvelope");
+    assert_valid(&schema, &response);
+    assert_eq!(response["error"]["category"], "unavailable");
+    assert_eq!(
+        response["error"]["code"],
+        "quota_probe_empty_after_prior_data"
+    );
+    assert_eq!(response["error"]["retryable"], true);
+}
+
+#[test]
+fn quota_probe_reports_retryable_error_for_nonzero_script() {
+    let output = invoke(
+        "quota.probe",
+        json!({
+            "settings_id": "claude-primary",
+            "context": {
+                "quota_script": "printf 'expired token' >&2; exit 4"
+            }
+        }),
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let response = json_stdout(&output);
+    let schema = compile_contract_ref("common.schema.json", "ErrorResponseEnvelope");
+    assert_valid(&schema, &response);
+    assert_eq!(response["error"]["category"], "unavailable");
+    assert_eq!(response["error"]["code"], "quota_probe_failed");
+    assert_eq!(response["error"]["retryable"], true);
+    assert!(response["error"]["details"]["stderr"]
+        .as_str()
+        .unwrap()
+        .contains("expired token"));
+}
+
+#[test]
+fn quota_probe_rejects_invalid_json_and_bad_resets_at() {
+    let invalid_json = invoke(
+        "quota.probe",
+        json!({
+            "settings_id": "claude-primary",
+            "context": {
+                "quota_script": "printf '%s' 'not-json'"
+            }
+        }),
+    );
+    assert_eq!(invalid_json.status.code(), Some(1));
+    let response = json_stdout(&invalid_json);
+    let schema = compile_contract_ref("common.schema.json", "ErrorResponseEnvelope");
+    assert_valid(&schema, &response);
+    assert_eq!(response["error"]["code"], "quota_probe_parse_failed");
+
+    let bad_resets_at = invoke(
+        "quota.probe",
+        json!({
+            "settings_id": "claude-primary",
+            "context": {
+                "quota_script": "printf '%s' '{\"used_percent\":12,\"resets_at\":\"not-a-date\"}'"
+            }
+        }),
+    );
+    assert_eq!(bad_resets_at.status.code(), Some(1));
+    let response = json_stdout(&bad_resets_at);
+    assert_valid(&schema, &response);
+    assert_eq!(response["error"]["code"], "quota_probe_parse_failed");
+    assert!(response["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Bad resets_at"));
+}
+
+#[test]
+fn quota_refresh_auth_executes_provider_owned_command() {
+    let marker = std::env::temp_dir().join(format!(
+        "agent-runner-claude-refresh-auth-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&marker);
+    let command = format!("printf refreshed > {}", marker.display());
+    let output = invoke(
+        "quota.refresh_auth",
+        json!({
+            "settings_id": "claude-primary",
+            "context": {
+                "auth_refresh_command": command,
+                "now_unix_ms": 1779991000200u64
+            }
+        }),
+    );
+    assert!(output.status.success());
+    let response = json_stdout(&output);
+    let schema = compile_contract_ref("quota.schema.json", "QuotaRefreshAuthResponse");
+    assert_valid(&schema, &response);
+
+    assert_eq!(response["result"]["refreshed"], true);
+    assert_eq!(response["result"]["available"], true);
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "refreshed");
+    let _ = std::fs::remove_file(marker);
+}
+
+#[test]
+fn quota_refresh_auth_reports_retryable_error_for_nonzero_command() {
+    let output = invoke(
+        "quota.refresh_auth",
+        json!({
+            "settings_id": "claude-primary",
+            "context": {
+                "auth_refresh_command": "printf 'login failed' >&2; exit 7"
+            }
+        }),
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let response = json_stdout(&output);
+    let schema = compile_contract_ref("common.schema.json", "ErrorResponseEnvelope");
+    assert_valid(&schema, &response);
+    assert_eq!(response["error"]["category"], "unavailable");
+    assert_eq!(response["error"]["code"], "quota_refresh_auth_failed");
+    assert_eq!(response["error"]["retryable"], true);
+    assert!(response["error"]["details"]["stderr"]
+        .as_str()
+        .unwrap()
+        .contains("login failed"));
+}
+
+#[test]
+fn quota_refresh_auth_uses_provider_toml_when_runtime_context_is_empty() {
+    let config_root = temp_config_root("quota-refresh-auth");
+    let marker = config_root.join("refresh-marker");
+    std::fs::write(
+        config_root.join("providers.toml"),
+        format!(
+            "[claude-primary]\nauth_refresh_command = \"printf refreshed > {}\"\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    let output = invoke_with_host(
+        "quota.refresh_auth",
+        json!({
+            "settings_id": "provider-a-test",
+            "force": false
+        }),
+        json!({ "config_root": config_root.display().to_string() }),
+    );
+    assert!(output.status.success());
+    let response = json_stdout(&output);
+    let schema = compile_contract_ref("quota.schema.json", "QuotaRefreshAuthResponse");
+    assert_valid(&schema, &response);
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "refreshed");
+    let _ = std::fs::remove_dir_all(config_root);
 }
 
 #[test]

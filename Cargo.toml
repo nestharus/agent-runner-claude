@@ -10,8 +10,10 @@ name = "agent-runner-claude"
 path = "src/main.rs"
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "0.8"
 
 [dev-dependencies]
 jsonschema = { version = "0.18", features = ["draft202012"] }

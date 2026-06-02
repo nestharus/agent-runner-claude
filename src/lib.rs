@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -20,9 +21,6 @@ const KNOWN_LATER_SUBCOMMANDS: &[&str] = &[
     "settings.delete",
     "settings.validate",
     "settings.migrate",
-    "quota.source",
-    "quota.probe",
-    "quota.refresh_auth",
     "session.locate_transcript",
     "session.read_turns",
     "session.capture",
@@ -135,6 +133,53 @@ struct TerminalClassifyParams {
     stderr_base64: String,
     status: ProcessStatus,
     observed_at_unix_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QuotaBaseParams {
+    settings_id: String,
+    #[allow(dead_code)]
+    model_name: Option<String>,
+    context: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QuotaRefreshAuthParams {
+    settings_id: String,
+    #[allow(dead_code)]
+    force: Option<bool>,
+    context: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct QuotaScriptOutput {
+    #[serde(default)]
+    windows: Option<Vec<QuotaScriptWindow>>,
+    #[serde(default)]
+    used_percent: Option<f64>,
+    #[serde(default)]
+    resets_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct QuotaScriptWindow {
+    #[serde(default)]
+    window_id: u32,
+    used_percent: f64,
+    resets_at: String,
+    #[serde(default)]
+    label: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CachedQuotaWindow {
+    #[allow(dead_code)]
+    name: Option<String>,
+    #[allow(dead_code)]
+    remaining_ratio: f64,
+    resets_at_unix_ms: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -268,6 +313,24 @@ impl ProviderFailure {
             exit_code,
         }
     }
+
+    fn unavailable(
+        request_id: String,
+        code: &'static str,
+        message: impl Into<String>,
+        retryable: bool,
+        details: Value,
+    ) -> Self {
+        Self {
+            request_id,
+            code,
+            category: "unavailable",
+            message: message.into(),
+            retryable,
+            details,
+            exit_code: 1,
+        }
+    }
 }
 
 pub fn handle_invocation(args: &[String], stdin: &str) -> InvocationOutput {
@@ -354,6 +417,9 @@ fn handle_decoded_invocation(
         "schema" => schema_response(request),
         "policy.evaluate" => policy_evaluate_response(request),
         "terminal.classify" => terminal_classify_response(request),
+        "quota.source" => quota_source_response(request),
+        "quota.probe" => quota_probe_response(request),
+        "quota.refresh_auth" => quota_refresh_auth_response(request),
         known if KNOWN_LATER_SUBCOMMANDS.contains(&known) => Err(ProviderFailure::unsupported(
             request.request_id,
             "capability_not_implemented",
@@ -540,6 +606,141 @@ fn terminal_classify_response(request: RequestEnvelope) -> Result<Value, Provide
     Ok(success_response(
         &request_id,
         json!({ "terminal_signal": terminal_signal_json(&signal) }),
+    ))
+}
+
+fn quota_source_response(request: RequestEnvelope) -> Result<Value, ProviderFailure> {
+    let request_id = request.request_id.clone();
+    let config_root = request.host.config_root.clone();
+    let provider_instance_id = request.provider_instance_id.clone();
+    let params: QuotaBaseParams = serde_json::from_value(request.params).map_err(|err| {
+        ProviderFailure::invalid_request(
+            request_id.clone(),
+            "invalid_quota_source_params",
+            format!("quota.source params do not match the provider contract: {err}"),
+        )
+    })?;
+    validate_settings_id(&request_id, &params.settings_id)?;
+    validate_quota_context(&request_id, &params.context)?;
+    let source = quota_script_for_request(
+        &params.context,
+        &params.settings_id,
+        provider_instance_id.as_deref(),
+        config_root.as_deref(),
+    );
+    let has_source = source.is_some();
+    let freshness = quota_source_freshness(has_source, &params.context);
+    let mut result = json!({
+        "has_source": has_source,
+        "freshness": freshness,
+    });
+    if has_source {
+        result["source_id"] = json!(quota_source_id(&params.settings_id));
+    }
+
+    Ok(success_response(&request_id, result))
+}
+
+fn quota_probe_response(request: RequestEnvelope) -> Result<Value, ProviderFailure> {
+    let request_id = request.request_id.clone();
+    let config_root = request.host.config_root.clone();
+    let provider_instance_id = request.provider_instance_id.clone();
+    let params: QuotaBaseParams = serde_json::from_value(request.params).map_err(|err| {
+        ProviderFailure::invalid_request(
+            request_id.clone(),
+            "invalid_quota_probe_params",
+            format!("quota.probe params do not match the provider contract: {err}"),
+        )
+    })?;
+    validate_settings_id(&request_id, &params.settings_id)?;
+    validate_quota_context(&request_id, &params.context)?;
+    let script = quota_script_for_request(
+        &params.context,
+        &params.settings_id,
+        provider_instance_id.as_deref(),
+        config_root.as_deref(),
+    )
+    .ok_or_else(|| {
+        ProviderFailure::unavailable(
+            request_id.clone(),
+            "quota_source_unavailable",
+            "quota.probe requires quota_script in context or providers.toml",
+            false,
+            json!({ "settings_id": params.settings_id }),
+        )
+    })?;
+
+    let checked_at = context_u64(&params.context, "now_unix_ms").unwrap_or_else(now_unix_ms);
+    let stdout = run_shell_command(&script, Duration::from_secs(30), CommandKind::Quota)
+        .map_err(|failure| command_failure(&request_id, failure, "quota_probe_failed"))?;
+    let windows = parse_quota_script_output(&stdout).map_err(|message| {
+        ProviderFailure::unavailable(
+            request_id.clone(),
+            "quota_probe_parse_failed",
+            message,
+            true,
+            json!({}),
+        )
+    })?;
+    if windows.is_empty() && context_has_prior_windows(&params.context) {
+        return Err(ProviderFailure::unavailable(
+            request_id,
+            "quota_probe_empty_after_prior_data",
+            "quota script returned empty windows after prior populated quota data",
+            true,
+            json!({ "refresh_auth_recommended": true }),
+        ));
+    }
+
+    Ok(success_response(
+        &request_id,
+        json!({
+            "available": true,
+            "checked_at_unix_ms": checked_at,
+            "windows": windows,
+            "detail": quota_probe_detail(&windows),
+        }),
+    ))
+}
+
+fn quota_refresh_auth_response(request: RequestEnvelope) -> Result<Value, ProviderFailure> {
+    let request_id = request.request_id.clone();
+    let config_root = request.host.config_root.clone();
+    let provider_instance_id = request.provider_instance_id.clone();
+    let params: QuotaRefreshAuthParams = serde_json::from_value(request.params).map_err(|err| {
+        ProviderFailure::invalid_request(
+            request_id.clone(),
+            "invalid_quota_refresh_auth_params",
+            format!("quota.refresh_auth params do not match the provider contract: {err}"),
+        )
+    })?;
+    validate_settings_id(&request_id, &params.settings_id)?;
+    validate_quota_context(&request_id, &params.context)?;
+    let Some(command) = auth_refresh_command_for_request(
+        &params.context,
+        &params.settings_id,
+        provider_instance_id.as_deref(),
+        config_root.as_deref(),
+    ) else {
+        return Err(ProviderFailure::unavailable(
+            request_id,
+            "quota_refresh_auth_unavailable",
+            "quota.refresh_auth requires auth_refresh_command in context or providers.toml",
+            false,
+            json!({ "settings_id": params.settings_id }),
+        ));
+    };
+
+    run_shell_command(&command, Duration::from_secs(15), CommandKind::Auth)
+        .map_err(|failure| command_failure(&request_id, failure, "quota_refresh_auth_failed"))?;
+    Ok(success_response(
+        &request_id,
+        json!({
+            "refreshed": true,
+            "available": true,
+            "checked_at_unix_ms": context_u64(&params.context, "now_unix_ms").unwrap_or_else(now_unix_ms),
+            "detail": "token refreshed",
+        }),
     ))
 }
 
@@ -860,6 +1061,529 @@ fn validate_proxy_filter_shape(
             "proxy-mode Claude must not use `--tools mcp__...`; use `--allowedTools` or omit the filter",
             "unsafe_proxy_claude_tools_restrict",
         ));
+    }
+}
+
+fn validate_settings_id(request_id: &str, settings_id: &str) -> Result<(), ProviderFailure> {
+    if !settings_id.trim().is_empty() {
+        return Ok(());
+    }
+    Err(ProviderFailure::invalid_request(
+        request_id.to_string(),
+        "invalid_settings_id",
+        "settings_id must be non-empty",
+    ))
+}
+
+fn validate_quota_context(
+    request_id: &str,
+    context: &Option<Value>,
+) -> Result<(), ProviderFailure> {
+    if context.as_ref().is_none_or(Value::is_object) {
+        return Ok(());
+    }
+    Err(ProviderFailure::invalid_request(
+        request_id.to_string(),
+        "invalid_quota_context",
+        "quota context must be a JSON object when supplied",
+    ))
+}
+
+fn quota_source_id(settings_id: &str) -> String {
+    format!("claude:{settings_id}:quota_script")
+}
+
+fn quota_script_from_context(context: &Option<Value>) -> Option<String> {
+    context_string(context, "quota_script").filter(|value| !value.trim().is_empty())
+}
+
+fn auth_refresh_command_from_context(context: &Option<Value>) -> Option<String> {
+    context_string(context, "auth_refresh_command").filter(|value| !value.trim().is_empty())
+}
+
+fn quota_script_for_request(
+    context: &Option<Value>,
+    settings_id: &str,
+    provider_instance_id: Option<&str>,
+    config_root: Option<&str>,
+) -> Option<String> {
+    quota_script_from_context(context).or_else(|| {
+        provider_quota_settings(context, settings_id, provider_instance_id, config_root)
+            .and_then(|settings| settings.quota_script)
+    })
+}
+
+fn auth_refresh_command_for_request(
+    context: &Option<Value>,
+    settings_id: &str,
+    provider_instance_id: Option<&str>,
+    config_root: Option<&str>,
+) -> Option<String> {
+    auth_refresh_command_from_context(context).or_else(|| {
+        provider_quota_settings(context, settings_id, provider_instance_id, config_root)
+            .and_then(|settings| settings.auth_refresh_command)
+    })
+}
+
+#[derive(Default)]
+struct ProviderQuotaSettings {
+    quota_script: Option<String>,
+    auth_refresh_command: Option<String>,
+}
+
+fn provider_quota_settings(
+    context: &Option<Value>,
+    settings_id: &str,
+    provider_instance_id: Option<&str>,
+    config_root: Option<&str>,
+) -> Option<ProviderQuotaSettings> {
+    let config_root = config_root?;
+    let providers_toml = std::path::Path::new(config_root).join("providers.toml");
+    let candidates = provider_config_candidates(context, provider_instance_id, settings_id);
+    let mut settings = std::fs::read_to_string(providers_toml)
+        .ok()
+        .and_then(|text| parse_provider_quota_settings(&text, &candidates))
+        .unwrap_or_default();
+    if settings.quota_script.is_none() {
+        if let Some(legacy) = legacy_session_quota_settings(config_root, &candidates) {
+            settings.quota_script = legacy.quota_script;
+        }
+    }
+    active_has_quota(&settings).then_some(settings)
+}
+
+fn legacy_session_quota_settings(
+    config_root: &str,
+    candidates: &[String],
+) -> Option<ProviderQuotaSettings> {
+    let sessions_toml = std::path::Path::new(config_root).join("sessions.toml");
+    let text = std::fs::read_to_string(sessions_toml).ok()?;
+    parse_provider_quota_settings(&text, candidates)
+}
+
+fn provider_config_candidates(
+    context: &Option<Value>,
+    provider_instance_id: Option<&str>,
+    settings_id: &str,
+) -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Some(provider_name) = context_string(context, "provider_name") {
+        push_candidate(&mut candidates, provider_name);
+    }
+    if let Some(provider_instance_id) = provider_instance_id {
+        push_candidate(&mut candidates, provider_instance_id.to_string());
+    }
+    push_candidate(&mut candidates, settings_id.to_string());
+    candidates
+}
+
+fn push_candidate(candidates: &mut Vec<String>, value: String) {
+    if value.trim().is_empty() || candidates.iter().any(|candidate| candidate == &value) {
+        return;
+    }
+    candidates.push(value);
+}
+
+fn parse_provider_quota_settings(
+    providers_toml: &str,
+    candidates: &[String],
+) -> Option<ProviderQuotaSettings> {
+    let parsed: toml::Value = toml::from_str(providers_toml).ok()?;
+    candidates.iter().find_map(|candidate| {
+        let settings = parse_provider_quota_settings_for_candidate(&parsed, candidate);
+        active_has_quota(&settings).then_some(settings)
+    })
+}
+
+fn parse_provider_quota_settings_for_candidate(
+    providers_toml: &toml::Value,
+    candidate: &str,
+) -> ProviderQuotaSettings {
+    let mut active = ProviderQuotaSettings::default();
+    let Some(table) = providers_toml.get(candidate) else {
+        return active;
+    };
+    active.quota_script = table_string(table, "quota_script");
+    active.auth_refresh_command = table_string(table, "auth_refresh_command");
+    if active.quota_script.is_none() {
+        active.quota_script = table_string(table, "turn_script")
+            .or_else(|| table_string(table, "cwd_script"))
+            .and_then(|command| derived_quota_script_from_adapter_command(&command));
+    }
+    if active.quota_script.is_none() {
+        active.quota_script = table
+            .get("session_storage")
+            .and_then(derived_quota_script_from_session_storage);
+    }
+    active
+}
+
+fn active_has_quota(settings: &ProviderQuotaSettings) -> bool {
+    settings.quota_script.is_some() || settings.auth_refresh_command.is_some()
+}
+
+fn table_string(table: &toml::Value, key: &str) -> Option<String> {
+    table
+        .get(key)
+        .and_then(toml::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToString::to_string)
+}
+
+fn derived_quota_script_from_session_storage(storage: &toml::Value) -> Option<String> {
+    table_string(storage, "cwd_script")
+        .and_then(|command| derived_quota_script_from_adapter_command(&command))
+        .or_else(|| derived_quota_script_from_claude_code_storage(storage))
+}
+
+fn derived_quota_script_from_claude_code_storage(storage: &toml::Value) -> Option<String> {
+    if table_string(storage, "kind").as_deref() != Some("claude_code") {
+        return None;
+    }
+    let projects_dir = table_string(storage, "projects_dir")?;
+    let cwd_script = format!("claude-code-cwd {}", shell_word_arg(&projects_dir));
+    derived_quota_script_from_adapter_command(&cwd_script)
+}
+
+fn derived_quota_script_from_adapter_command(command: &str) -> Option<String> {
+    let parts = shell_split(command);
+    let adapter = parts.first()?;
+    let adapter_name = std::path::Path::new(adapter).file_name()?.to_str()?;
+    let storage_root = parts.get(1)?;
+    let account_root = std::path::Path::new(storage_root).parent()?;
+    match adapter_name {
+        "claude-code-turns" | "claude-code-cwd" => Some(format!(
+            "anthropic-usage {}",
+            shell_word_arg(&account_root.join(".credentials.json").to_string_lossy())
+        )),
+        _ => None,
+    }
+}
+
+fn shell_word_arg(input: &str) -> String {
+    if is_bare_shell_word(input) {
+        return input.to_string();
+    }
+    quote_shell_word(input)
+}
+
+fn is_bare_shell_word(input: &str) -> bool {
+    input
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | '~'))
+}
+
+fn quote_shell_word(input: &str) -> String {
+    format!("'{}'", input.replace('\'', r#"'\''"#))
+}
+
+fn context_string(context: &Option<Value>, key: &str) -> Option<String> {
+    context
+        .as_ref()
+        .and_then(|value| nested_context_value(value, key))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+}
+
+fn context_u64(context: &Option<Value>, key: &str) -> Option<u64> {
+    context
+        .as_ref()
+        .and_then(|value| nested_context_value(value, key))
+        .and_then(Value::as_u64)
+}
+
+fn nested_context_value<'a>(context: &'a Value, key: &str) -> Option<&'a Value> {
+    context
+        .get(key)
+        .or_else(|| {
+            context
+                .get("settings")
+                .and_then(|settings| settings.get(key))
+        })
+        .or_else(|| context.get("cache").and_then(|cache| cache.get(key)))
+}
+
+fn quota_source_freshness(has_source: bool, context: &Option<Value>) -> &'static str {
+    if !has_source {
+        return "no_source";
+    }
+    if cached_quota_fresh(context) {
+        return "fresh";
+    }
+    "probe_required"
+}
+
+fn cached_quota_fresh(context: &Option<Value>) -> bool {
+    let Some(checked_at) = context_u64(context, "cached_checked_at_unix_ms") else {
+        return false;
+    };
+    let windows = cached_windows(context);
+    if windows.is_empty() {
+        return false;
+    }
+    let now = context_u64(context, "now_unix_ms").unwrap_or_else(now_unix_ms);
+    let ttl_ms = dynamic_quota_ttl_ms(&windows, now);
+    now.saturating_sub(checked_at) < ttl_ms
+}
+
+fn cached_windows(context: &Option<Value>) -> Vec<CachedQuotaWindow> {
+    let Some(value) = context
+        .as_ref()
+        .and_then(|item| nested_context_value(item, "cached_windows"))
+    else {
+        return Vec::new();
+    };
+    serde_json::from_value(value.clone()).unwrap_or_default()
+}
+
+fn context_has_prior_windows(context: &Option<Value>) -> bool {
+    if context
+        .as_ref()
+        .and_then(|item| nested_context_value(item, "had_prior_windows"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    !cached_windows(context).is_empty()
+}
+
+fn dynamic_quota_ttl_ms(windows: &[CachedQuotaWindow], now_unix_ms: u64) -> u64 {
+    const MIN_TTL_MS: u64 = 5 * 60 * 1000;
+    const MAX_TTL_MS: u64 = 24 * 60 * 60 * 1000;
+    const REFRESH_WINDOW_DIVISOR: u64 = 5;
+    let min_reset_ms = windows
+        .iter()
+        .map(|window| window.resets_at_unix_ms.saturating_sub(now_unix_ms))
+        .min()
+        .unwrap_or(MAX_TTL_MS);
+    (min_reset_ms / REFRESH_WINDOW_DIVISOR).clamp(MIN_TTL_MS, MAX_TTL_MS)
+}
+
+fn parse_quota_script_output(stdout: &str) -> Result<Vec<Value>, String> {
+    let parsed: QuotaScriptOutput = serde_json::from_str(stdout.trim()).map_err(|err| {
+        format!(
+            "Invalid JSON from quota script: {err} (got: {})",
+            stdout.trim()
+        )
+    })?;
+    let mut windows = match parsed.windows {
+        Some(windows) => windows,
+        None => legacy_quota_window(parsed.used_percent, parsed.resets_at, stdout)?,
+    };
+    let mut output = Vec::with_capacity(windows.len());
+    for (index, window) in windows.iter_mut().enumerate() {
+        window.window_id = index as u32;
+        output.push(quota_window_json(window, stdout)?);
+    }
+    Ok(output)
+}
+
+fn legacy_quota_window(
+    used_percent: Option<f64>,
+    resets_at: Option<String>,
+    stdout: &str,
+) -> Result<Vec<QuotaScriptWindow>, String> {
+    let Some(used_percent) = used_percent else {
+        return Err(format!(
+            "quota script emitted neither `windows` nor `used_percent` (got: {})",
+            stdout.trim()
+        ));
+    };
+    let Some(resets_at) = resets_at else {
+        return Err(format!(
+            "legacy quota script emitted `used_percent` without `resets_at` (got: {})",
+            stdout.trim()
+        ));
+    };
+    Ok(vec![QuotaScriptWindow {
+        window_id: 0,
+        used_percent,
+        resets_at,
+        label: None,
+    }])
+}
+
+fn quota_window_json(window: &QuotaScriptWindow, stdout: &str) -> Result<Value, String> {
+    validate_used_percent(window.used_percent, stdout)?;
+    let resets_at_unix_ms = parse_rfc3339_unix_ms(&window.resets_at)?;
+    let mut value = json!({
+        "remaining_ratio": 1.0 - (window.used_percent / 100.0),
+        "resets_at_unix_ms": resets_at_unix_ms,
+    });
+    if let Some(label) = window.label.as_deref().filter(|label| !label.is_empty()) {
+        value["name"] = json!(label);
+    }
+    Ok(value)
+}
+
+fn validate_used_percent(used_percent: f64, stdout: &str) -> Result<(), String> {
+    if !used_percent.is_nan() && (0.0..=100.0).contains(&used_percent) {
+        return Ok(());
+    }
+    Err(format!(
+        "quota script emitted used_percent={used_percent} outside 0..100 (got: {})",
+        stdout.trim()
+    ))
+}
+
+fn parse_rfc3339_unix_ms(timestamp: &str) -> Result<u64, String> {
+    let parsed = DateTime::parse_from_rfc3339(timestamp)
+        .map_err(|err| format!("Bad resets_at {timestamp}: {err}"))?
+        .with_timezone(&Utc);
+    u64::try_from(parsed.timestamp_millis())
+        .map_err(|_| format!("Bad resets_at {timestamp}: timestamp before unix epoch"))
+}
+
+fn quota_probe_detail(windows: &[Value]) -> String {
+    if windows.is_empty() {
+        return "no quota windows reported".to_string();
+    }
+    format!("{} quota window(s) reported", windows.len())
+}
+
+#[derive(Clone, Copy)]
+enum CommandKind {
+    Quota,
+    Auth,
+}
+
+struct ShellCommandOutput {
+    stdout: String,
+}
+
+enum ShellCommandFailure {
+    Spawn(String),
+    Wait(String),
+    Timeout(CommandKind),
+    Nonzero { code: i32, stderr: String },
+}
+
+fn run_shell_command(
+    command: &str,
+    timeout: Duration,
+    kind: CommandKind,
+) -> Result<String, ShellCommandFailure> {
+    let mut child = Command::new("sh");
+    child.arg("-c").arg(command);
+    child.stdin(Stdio::null());
+    child.stdout(Stdio::piped());
+    child.stderr(Stdio::piped());
+    let mut child = child
+        .spawn()
+        .map_err(|err| ShellCommandFailure::Spawn(format_command_spawn_error(kind, err)))?;
+    let stdout = child
+        .stdout
+        .take()
+        .map(spawn_string_drain)
+        .expect("stdout was piped");
+    let stderr = child
+        .stderr
+        .take()
+        .map(spawn_string_drain)
+        .expect("stderr was piped");
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let output = ShellCommandOutput {
+                    stdout: stdout.join().unwrap_or_default(),
+                };
+                let stderr = stderr.join().unwrap_or_default();
+                if status.success() {
+                    return Ok(output.stdout);
+                }
+                return Err(ShellCommandFailure::Nonzero {
+                    code: status.code().unwrap_or(-1),
+                    stderr,
+                });
+            }
+            Ok(None) if started.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ShellCommandFailure::Timeout(kind));
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(50)),
+            Err(err) => {
+                return Err(ShellCommandFailure::Wait(format_command_wait_error(
+                    kind, err,
+                )))
+            }
+        }
+    }
+}
+
+fn spawn_string_drain<R>(mut reader: R) -> thread::JoinHandle<String>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut buffer = String::new();
+        let _ = reader.read_to_string(&mut buffer);
+        buffer
+    })
+}
+
+fn command_failure(
+    request_id: &str,
+    failure: ShellCommandFailure,
+    default_code: &'static str,
+) -> ProviderFailure {
+    match failure {
+        ShellCommandFailure::Spawn(message) | ShellCommandFailure::Wait(message) => {
+            ProviderFailure::unavailable(
+                request_id.to_string(),
+                default_code,
+                message,
+                true,
+                json!({ "refresh_auth_recommended": true }),
+            )
+        }
+        ShellCommandFailure::Timeout(kind) => timeout_failure(request_id, kind),
+        ShellCommandFailure::Nonzero { code, stderr } => ProviderFailure::unavailable(
+            request_id.to_string(),
+            default_code,
+            format!("quota command exited {code}: {}", stderr.trim()),
+            true,
+            json!({
+                "exit_code": code,
+                "stderr": stderr,
+                "refresh_auth_recommended": true,
+            }),
+        ),
+    }
+}
+
+fn timeout_failure(request_id: &str, kind: CommandKind) -> ProviderFailure {
+    let (code, message) = match kind {
+        CommandKind::Quota => ("quota_probe_timeout", "quota script timed out"),
+        CommandKind::Auth => (
+            "quota_refresh_auth_timeout",
+            "auth_refresh_command timed out",
+        ),
+    };
+    ProviderFailure {
+        request_id: request_id.to_string(),
+        code,
+        category: "timeout",
+        message: message.to_string(),
+        retryable: true,
+        details: json!({ "refresh_auth_recommended": true }),
+        exit_code: 1,
+    }
+}
+
+fn format_command_spawn_error(kind: CommandKind, error: std::io::Error) -> String {
+    match kind {
+        CommandKind::Quota => format!("Failed to spawn quota script: {error}"),
+        CommandKind::Auth => format!("Failed to spawn auth_refresh_command: {error}"),
+    }
+}
+
+fn format_command_wait_error(kind: CommandKind, error: std::io::Error) -> String {
+    match kind {
+        CommandKind::Quota => format!("Quota script wait failed: {error}"),
+        CommandKind::Auth => format!("auth_refresh_command wait failed: {error}"),
     }
 }
 
@@ -1209,7 +1933,7 @@ pub fn describe_result() -> Value {
         "capabilities": {
             "launch": true,
             "policy": true,
-            "quota": false,
+            "quota": true,
             "session": false,
             "terminal": true,
             "rotation": false,
@@ -1476,11 +2200,37 @@ mod tests {
     fn unsupported_future_capability_uses_contract_error() {
         let args = vec![
             "agent-runner-claude".to_string(),
-            "quota.source".to_string(),
+            "session.read_turns".to_string(),
         ];
         let output = handle_invocation(&args, &request(json!({})));
         assert_eq!(output.exit_code, 3);
         let body: Value = serde_json::from_str(&output.stdout).unwrap();
         assert_eq!(body["error"]["category"], "unsupported");
+    }
+
+    #[test]
+    fn shell_command_timeout_does_not_wait_for_inherited_pipes() {
+        let started = std::time::Instant::now();
+        let result = run_shell_command("sleep 2", Duration::from_millis(10), CommandKind::Quota);
+        assert!(matches!(
+            result,
+            Err(ShellCommandFailure::Timeout(CommandKind::Quota))
+        ));
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "timeout path waited for descendant-held pipes"
+        );
+    }
+
+    #[test]
+    fn auth_timeout_failure_uses_auth_specific_code() {
+        let failure = command_failure(
+            "req-auth-timeout",
+            ShellCommandFailure::Timeout(CommandKind::Auth),
+            "quota_refresh_auth_failed",
+        );
+        assert_eq!(failure.code, "quota_refresh_auth_timeout");
+        assert_eq!(failure.category, "timeout");
+        assert_eq!(failure.message, "auth_refresh_command timed out");
     }
 }
