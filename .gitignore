@@ -1,3 +1,5 @@
 /target/
 /_agent_prompt_*.md
 /agents-orchestrator.log
+/.tmp/
+/planning/s9-foundation/
