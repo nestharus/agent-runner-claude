@@ -1,13 +1,10 @@
-use std::io::Read;
+// declared_role: orchestration
 
-fn main() {
-    let mut stdin = String::new();
-    if let Err(err) = std::io::stdin().read_to_string(&mut stdin) {
-        eprintln!("failed to read stdin: {err}");
-        std::process::exit(2);
-    }
-
-    let args = std::env::args().collect::<Vec<_>>();
-    let exit_code = agent_runner_claude::write_invocation(&args, &stdin, &mut std::io::stdout());
-    std::process::exit(exit_code);
+fn main() -> std::process::ExitCode {
+    agent_runner_claude::run_cli(
+        std::env::args(),
+        std::io::stdin(),
+        std::io::stdout(),
+        std::io::stderr(),
+    )
 }
