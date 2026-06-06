@@ -186,7 +186,7 @@ fn declares_confirmed_provider_write(action: &Value) -> bool {
         && action
             .get("confirmed")
             .and_then(Value::as_bool)
-            .unwrap_or(true)
+            .unwrap_or(false)
 }
 
 fn confirmed_provider_write(

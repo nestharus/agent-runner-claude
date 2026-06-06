@@ -33,7 +33,23 @@ pub fn parse_canonical(bytes: &[u8]) -> Result<Vec<CanonicalRecord>, ProviderFai
         let value = parse_canonical_line(trimmed, line_number)?;
         records.push(parse_record(value, line_number)?);
     }
+    ensure_non_empty_records(&records)?;
     Ok(records)
+}
+
+fn ensure_non_empty_records(records: &[CanonicalRecord]) -> Result<(), ProviderFailure> {
+    if records.is_empty() {
+        Err(empty_canonical_transcript())
+    } else {
+        Ok(())
+    }
+}
+
+fn empty_canonical_transcript() -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        "empty_canonical_transcript",
+        "canonical transcript must contain at least one record",
+    )
 }
 
 fn non_empty_line(line: &str) -> Option<&str> {

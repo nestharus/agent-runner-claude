@@ -119,7 +119,94 @@ fn settings_command_update_params(id: &str, version: &str, command: &str) -> Val
 }
 
 fn settings_validate_dry_run_params() -> Value {
-    json!({ "values": { "display_name": "dry", "command": "claude", "api_key": "sk-secret" } })
+    settings_validate_params(json!({ "command": "claude", "api_key": "sk-secret" }))
+}
+
+fn settings_validate_params(values: Value) -> Value {
+    json!({ "values": values })
+}
+
+fn valid_settings_schema_hooks() -> Value {
+    json!({
+        "name": "claude-primary",
+        "command": "claude",
+        "args": ["--print"],
+        "interactive_args": ["--interactive"],
+        "prompt_mode": "stdin",
+        "invocation_mode": "proxy",
+        "api_key": "sk-secret",
+        "auth_token": "token-secret",
+        "quota_script": "anthropic-usage",
+        "auth_refresh_command": "refresh-auth",
+        "resume": { "kind": "flag", "flag": "--resume" },
+        "session_capture": {
+            "kind": "stdout_json_event",
+            "json_flag": "--output-format=json",
+            "last_message_flag": "--last-message",
+            "event_type": "system.init",
+            "event_id_path": "session_id"
+        },
+        "resume_acceptance": {
+            "accepted_output_patterns": ["resumed"],
+            "rejected_output_patterns": ["not found"]
+        },
+        "session_storage": {
+            "kind": "script",
+            "cwd_script": "pwd",
+            "transcript_script": "transcript-path",
+            "storage_type": "claude_code"
+        },
+        "system_prompt_override": "system prompt",
+        "tool_restrictions": {
+            "kind": "claude",
+            "claude": {
+                "allowed_tools": ["Read"],
+                "disable_slash_commands": true
+            }
+        },
+        "setup_brain_model": "claude-sonnet-4-6"
+    })
+}
+
+fn invalid_settings_schema_hook_cases() -> Vec<(&'static str, Value)> {
+    vec![
+        (
+            "missing required command",
+            json!({ "quota_script": "quota" }),
+        ),
+        (
+            "unknown settings value field",
+            json!({ "command": "claude", "display_name": "not-a-values-field" }),
+        ),
+        (
+            "proxy invocation enum",
+            json!({ "command": "claude", "invocation_mode": "sidecar" }),
+        ),
+        (
+            "quota hook type",
+            json!({ "command": "claude", "quota_script": ["quota"] }),
+        ),
+        (
+            "auth hook type",
+            json!({ "command": "claude", "auth_refresh_command": false }),
+        ),
+        (
+            "resume hook shape",
+            json!({ "command": "claude", "resume": { "kind": "flag", "flag": "" } }),
+        ),
+        (
+            "capture hook shape",
+            json!({ "command": "claude", "session_capture": { "kind": "forced_flag_verified", "flag": "" } }),
+        ),
+        (
+            "storage hook dependencies",
+            json!({ "command": "claude", "session_storage": { "kind": "script", "cwd_script": "cwd", "transcript_script": "transcript" } }),
+        ),
+        (
+            "tool restriction shape",
+            json!({ "command": "claude", "tool_restrictions": { "kind": "claude", "claude": { "allowed_tools": [""] } } }),
+        ),
+    ]
 }
 
 fn settings_dry_run_migrate_params() -> Value {
@@ -245,6 +332,27 @@ fn assert_settings_validate_response(response: &Value) {
 
 fn assert_settings_validate_valid(response: &Value) {
     assert!(response["result"]["valid"].as_bool().unwrap());
+}
+
+fn assert_settings_validate_invalid(response: &Value, case_name: &str) {
+    assert_settings_validate_response(response);
+    assert!(
+        !response["result"]["valid"].as_bool().unwrap(),
+        "settings.validate unexpectedly accepted {case_name}: {response}"
+    );
+    assert!(
+        settings_validate_diagnostic_codes(response).contains(&"invalid_settings_value"),
+        "settings.validate did not report schema diagnostics for {case_name}: {response}"
+    );
+}
+
+fn settings_validate_diagnostic_codes(response: &Value) -> Vec<&str> {
+    response["result"]["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|diagnostic| diagnostic["code"].as_str())
+        .collect()
 }
 
 fn assert_settings_migrate_response(response: &Value) {
@@ -590,6 +698,32 @@ fn settings_validate_and_dry_run_migrate_never_persist() {
         settings_dry_run_migrate_params(),
     );
     assert_settings_migrate_response(&migrated);
+
+    let listed = call(&roots, "settings.list", settings_list_params());
+    assert_settings_list_response(&listed);
+    assert_settings_list_empty(&listed);
+}
+
+#[test]
+fn settings_validate_enforces_provider_settings_schema_hooks_without_persistence() {
+    let roots = temp_roots("settings-validate-schema-hooks");
+
+    let valid = call(
+        &roots,
+        "settings.validate",
+        settings_validate_params(valid_settings_schema_hooks()),
+    );
+    assert_settings_validate_response(&valid);
+    assert_settings_validate_valid(&valid);
+
+    for (case_name, values) in invalid_settings_schema_hook_cases() {
+        let response = call(
+            &roots,
+            "settings.validate",
+            settings_validate_params(values),
+        );
+        assert_settings_validate_invalid(&response, case_name);
+    }
 
     let listed = call(&roots, "settings.list", settings_list_params());
     assert_settings_list_response(&listed);

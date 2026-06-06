@@ -119,6 +119,40 @@ fn assert_provider_owned_action(action: &Value) {
     );
 }
 
+fn assert_declared_migration_action_shape(action: &Value) {
+    assert!(
+        action.get("kind").and_then(Value::as_str).is_some(),
+        "migration action missing kind: {action}"
+    );
+    assert_eq!(action["provider_owned"], true);
+    assert!(
+        action.get("confirmed").and_then(Value::as_bool).is_some(),
+        "migration action missing confirmed: {action}"
+    );
+    assert!(
+        action
+            .get("path")
+            .and_then(Value::as_str)
+            .is_some_and(|path| !path.is_empty()),
+        "migration action missing path: {action}"
+    );
+    assert_action_content_shape(action);
+}
+
+fn assert_action_content_shape(action: &Value) {
+    let content = action["content"]
+        .as_object()
+        .unwrap_or_else(|| panic!("migration action missing content: {action}"));
+    assert!(matches!(
+        content.get("encoding").and_then(Value::as_str),
+        Some("utf8" | "base64")
+    ));
+    assert!(
+        content.get("data").and_then(Value::as_str).is_some(),
+        "migration action content missing data: {action}"
+    );
+}
+
 fn assert_artifact_digest(artifact: &Value) {
     let sha = artifact["sha256"].as_str().expect("artifact sha256");
     assert_eq!(sha.len(), 64);
@@ -176,6 +210,7 @@ fn assert_migration_plan_response(response: &Value) {
     assert!(!result["actions"].as_array().unwrap().is_empty());
     for action in result["actions"].as_array().unwrap() {
         assert_provider_owned_action(action);
+        assert_declared_migration_action_shape(action);
     }
     assert!(result["requires_backup"].as_bool().unwrap());
     assert!(
@@ -316,18 +351,21 @@ fn migration_apply_params(
             {
                 "kind": "write_file",
                 "provider_owned": true,
+                "confirmed": true,
                 "path": provider_root.join("settings.v1.json").display().to_string(),
                 "content": { "encoding": "utf8", "data": "{\"provider\":\"claude\"}" }
             },
             {
                 "kind": "write_file",
                 "provider_owned": false,
+                "confirmed": true,
                 "path": central_state.display().to_string(),
                 "content": { "encoding": "utf8", "data": "SHOULD_NOT_BE_WRITTEN" }
             },
             {
                 "kind": "write_file",
                 "provider_owned": false,
+                "confirmed": true,
                 "path": central_journal.display().to_string(),
                 "content": { "encoding": "utf8", "data": "SHOULD_NOT_BE_WRITTEN_TO_JOURNAL" }
             },
@@ -425,12 +463,14 @@ fn host_path_apply_params(
             {
                 "kind": "write_file",
                 "provider_owned": true,
+                "confirmed": true,
                 "path": central_journal.display().to_string(),
                 "content": { "encoding": "utf8", "data": "SHOULD_NOT_OVERWRITE_HOST_JOURNAL" }
             },
             {
                 "kind": "write_file",
                 "provider_owned": true,
+                "confirmed": true,
                 "path": central_state.display().to_string(),
                 "content": { "encoding": "utf8", "data": "SHOULD_NOT_OVERWRITE_HOST_STATE" }
             }
@@ -486,6 +526,7 @@ fn symlink_apply_params(roots: &TempRoots, provider_root: &Path) -> Value {
             {
                 "kind": "write_file",
                 "provider_owned": true,
+                "confirmed": true,
                 "path": provider_root.join("linked-outside/settings.v1.json").display().to_string(),
                 "content": { "encoding": "utf8", "data": "SHOULD_NOT_OVERWRITE_OUTSIDE" }
             }

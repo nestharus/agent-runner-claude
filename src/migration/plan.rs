@@ -11,7 +11,8 @@ pub fn handle(request: &RequestEnvelope) -> Result<Value, ProviderFailure> {
     let params = plan_params(request)?;
     let provider_root = provider_root(request, params)?;
     let to = target_settings_schema(params);
-    Ok(plan_response(&provider_root, to))
+    let content = planned_settings_content(params, to);
+    Ok(plan_response(&provider_root, to, &content))
 }
 
 fn plan_params(
@@ -133,16 +134,42 @@ fn target_settings_schema(params: &serde_json::Map<String, Value>) -> &str {
         .unwrap_or("claude.settings/v1")
 }
 
-fn plan_response(provider_root: &str, to: &str) -> Value {
+fn planned_settings_content(params: &serde_json::Map<String, Value>, schema_id: &str) -> Value {
+    json!({
+        "schema_id": schema_id,
+        "records": legacy_settings_records(params)
+    })
+}
+
+fn legacy_settings_records(params: &serde_json::Map<String, Value>) -> Vec<Value> {
+    legacy_provider_entries(params)
+        .into_iter()
+        .map(legacy_settings_record)
+        .collect()
+}
+
+fn legacy_provider_entries(params: &serde_json::Map<String, Value>) -> Vec<(&String, &Value)> {
+    params
+        .get("legacy")
+        .and_then(|legacy| legacy.get("providers.toml"))
+        .and_then(Value::as_object)
+        .map(|providers| providers.iter().collect())
+        .unwrap_or_default()
+}
+
+fn legacy_settings_record((name, values): (&String, &Value)) -> Value {
+    json!({
+        "id": name,
+        "display_name": name,
+        "values": values
+    })
+}
+
+fn plan_response(provider_root: &str, to: &str, content: &Value) -> Value {
     json!({
         "actions": [
-            super::legacy::planned_write(provider_root),
-            {
-                "kind": "backup_provider_file",
-                "provider_owned": true,
-                "path": format!("{provider_root}/settings.v1.json"),
-                "description": "backup existing Claude provider settings before migration"
-            }
+            super::legacy::planned_write(provider_root, content),
+            backup_action(provider_root)
         ],
         "warnings": [
             "Create and verify a backup before applying provider-owned migration actions.",
@@ -154,6 +181,17 @@ fn plan_response(provider_root: &str, to: &str) -> Value {
             "message": "Confirm only provider-owned Claude file actions; host central state remains host-owned.",
             "provider_owned_only": true
         }
+    })
+}
+
+fn backup_action(provider_root: &str) -> Value {
+    json!({
+        "kind": "backup_provider_file",
+        "provider_owned": true,
+        "confirmed": true,
+        "path": format!("{provider_root}/settings.v1.json"),
+        "content": { "encoding": "utf8", "data": "" },
+        "description": "backup existing Claude provider settings before migration"
     })
 }
 

@@ -165,6 +165,10 @@ fn invalid_canonical_input() -> &'static [u8] {
     b"not jsonl\n"
 }
 
+fn empty_canonical_input() -> &'static [u8] {
+    b""
+}
+
 fn conflict_original_native() -> Vec<u8> {
     native_one("sess-conflict", "u1", "original")
 }
@@ -307,6 +311,15 @@ fn invalid_canonical_params(path: &Path, original: &[u8]) -> Value {
         "sess-invalid",
         path,
         invalid_canonical_input(),
+        Some(sha256_hex(original)),
+    )
+}
+
+fn empty_canonical_params(path: &Path, original: &[u8]) -> Value {
+    session_replace_params(
+        "sess-invalid",
+        path,
+        empty_canonical_input(),
         Some(sha256_hex(original)),
     )
 }
@@ -605,6 +618,17 @@ fn replace_rejects_invalid_canonical_input_before_touching_transcript() {
     write_transcript(&path, &original);
 
     let (code, response) = call(&roots, invalid_canonical_params(&path, &original));
+    assert_invalid_canonical_rejection(code, &response, &path, &original);
+}
+
+#[test]
+fn replace_rejects_empty_canonical_input_before_touching_transcript() {
+    let roots = temp_roots("session-replace-empty-canonical");
+    let path = transcript_path(&roots, "empty.jsonl");
+    let original = invalid_original_native();
+    write_transcript(&path, &original);
+
+    let (code, response) = call(&roots, empty_canonical_params(&path, &original));
     assert_invalid_canonical_rejection(code, &response, &path, &original);
 }
 

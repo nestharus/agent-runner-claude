@@ -1,5 +1,6 @@
 // declared_role: accessor, formatter, mapper, orchestration, validator
 
+use jsonschema::{Draft, JSONSchema};
 use serde_json::{json, Map, Value};
 
 use crate::envelope::decode::RequestEnvelope;
@@ -135,59 +136,22 @@ fn format_validate_response(valid: bool, diagnostics: Vec<Value>) -> Value {
 }
 
 pub fn validate_values(values: &Value) -> Vec<Value> {
-    let Some(object) = values_object(values) else {
+    if values_object(values).is_none() {
         return vec![settings_values_must_be_object_diagnostic()];
-    };
-
-    value_rule_diagnostics(object)
+    }
+    provider_settings_schema_diagnostics(values)
 }
 
 fn values_object(values: &Value) -> Option<&Map<String, Value>> {
     values.as_object()
 }
 
-fn value_rule_diagnostics(object: &Map<String, Value>) -> Vec<Value> {
-    let mut diagnostics = Vec::new();
-    diagnostics.extend(string_fields_diagnostics(object));
-    diagnostics.extend(args_diagnostics(object));
-    diagnostics.extend(tool_restrictions_diagnostics(object));
-    diagnostics
-}
-
-fn string_fields_diagnostics(object: &Map<String, Value>) -> Vec<Value> {
-    let mut diagnostics = Vec::new();
-    for key in [
-        "command",
-        "quota_script",
-        "auth_refresh_command",
-        "setup_brain_model",
-    ] {
-        string_field(object, key, &mut diagnostics);
-    }
-    diagnostics
-}
-
-fn args_diagnostics(object: &Map<String, Value>) -> Vec<Value> {
-    let mut diagnostics = Vec::new();
-    if let Some(args) = object.get("args") {
-        validate_args(args, &mut diagnostics);
-    }
-    diagnostics
-}
-
-fn validate_args(value: &Value, diagnostics: &mut Vec<Value>) {
-    match value.as_array() {
-        Some(items) if items.iter().all(Value::is_string) => {}
-        _ => diagnostics.push(args_must_be_strings_diagnostic()),
-    }
-}
-
-fn tool_restrictions_diagnostics(object: &Map<String, Value>) -> Vec<Value> {
-    let mut diagnostics = Vec::new();
-    if let Some(restrictions) = object.get("tool_restrictions") {
-        validate_tool_restrictions(restrictions, &mut diagnostics);
-    }
-    diagnostics
+fn provider_settings_schema_diagnostics(values: &Value) -> Vec<Value> {
+    let compiled = compiled_provider_settings_schema();
+    compiled
+        .validate(values)
+        .map(|_| Vec::new())
+        .unwrap_or_else(|errors| errors.map(settings_schema_diagnostic).collect())
 }
 
 pub fn required_object<'a>(
@@ -213,19 +177,27 @@ pub fn diagnostic(severity: &str, path: &str, code: &str, message: &str) -> Valu
     })
 }
 
-fn string_field(object: &Map<String, Value>, key: &str, diagnostics: &mut Vec<Value>) {
-    if object.get(key).is_some_and(|value| !value.is_string()) {
-        diagnostics.push(string_field_diagnostic(key));
-    }
+fn compiled_provider_settings_schema() -> JSONSchema {
+    JSONSchema::options()
+        .with_draft(Draft::Draft202012)
+        .compile(&crate::settings_schema::settings_schema())
+        .expect("claude.settings/v1 schema must compile")
 }
 
-fn validate_tool_restrictions(value: &Value, diagnostics: &mut Vec<Value>) {
-    let Some(object) = value.as_object() else {
-        diagnostics.push(tool_restrictions_must_be_object_diagnostic());
-        return;
-    };
-    if object.get("kind").is_some_and(|kind| kind != "claude") {
-        diagnostics.push(unsupported_tool_restrictions_kind_diagnostic());
+fn settings_schema_diagnostic(error: jsonschema::error::ValidationError<'_>) -> Value {
+    diagnostic(
+        "error",
+        &settings_schema_diagnostic_path(&error.instance_path.to_string()),
+        "invalid_settings_value",
+        &format!("settings value does not satisfy claude.settings/v1: {error}"),
+    )
+}
+
+fn settings_schema_diagnostic_path(instance_path: &str) -> String {
+    if instance_path.is_empty() {
+        "values".to_string()
+    } else {
+        format!("values{instance_path}")
     }
 }
 
@@ -235,41 +207,5 @@ fn settings_values_must_be_object_diagnostic() -> Value {
         "values",
         "settings_values_must_be_object",
         "settings values must be an object",
-    )
-}
-
-fn string_field_diagnostic(key: &str) -> Value {
-    diagnostic(
-        "error",
-        &format!("values.{key}"),
-        "settings_field_must_be_string",
-        &format!("{key} must be a string"),
-    )
-}
-
-fn args_must_be_strings_diagnostic() -> Value {
-    diagnostic(
-        "error",
-        "values.args",
-        "settings_args_must_be_strings",
-        "args must be an array of strings",
-    )
-}
-
-fn tool_restrictions_must_be_object_diagnostic() -> Value {
-    diagnostic(
-        "error",
-        "values.tool_restrictions",
-        "tool_restrictions_must_be_object",
-        "tool_restrictions must be an object",
-    )
-}
-
-fn unsupported_tool_restrictions_kind_diagnostic() -> Value {
-    diagnostic(
-        "error",
-        "values.tool_restrictions.kind",
-        "unsupported_tool_restrictions_kind",
-        "only claude tool restrictions are supported",
     )
 }
