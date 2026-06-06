@@ -1,4 +1,11 @@
 // declared_role: orchestration, formatter
+// intrinsic_surface_declarations:
+//   - component: src/migration/mod.rs
+//     role: intrinsic-surface
+//     Domain: migration_capability_module_index
+//     Owns:
+//       - migration capability submodule declaration set
+//       - migration subcommand to handler routing surface
 
 use serde_json::Value;
 

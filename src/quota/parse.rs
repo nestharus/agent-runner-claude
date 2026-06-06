@@ -1,4 +1,4 @@
-// declared_role: parser, validator, mapper
+// declared_role: parser, validator, mapper, formatter
 
 use serde_json::Value;
 
@@ -9,9 +9,12 @@ pub fn parse_quota_value(value: &str) -> Result<Value, serde_json::Error> {
 pub fn parse_windows(stdout: &[u8]) -> Result<Vec<Value>, String> {
     let text =
         std::str::from_utf8(stdout).map_err(|_| "quota stdout must be UTF-8 JSON".to_string())?;
-    let value =
-        parse_quota_value(text).map_err(|error| format!("quota stdout must be JSON: {error}"))?;
+    let value = parse_quota_value(text).map_err(quota_stdout_json_error)?;
     parse_value_windows(&value)
+}
+
+fn quota_stdout_json_error(error: serde_json::Error) -> String {
+    format!("quota stdout must be JSON: {error}")
 }
 
 fn parse_value_windows(value: &Value) -> Result<Vec<Value>, String> {

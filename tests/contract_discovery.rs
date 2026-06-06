@@ -1,4 +1,11 @@
 // declared_role: orchestration, mapper, formatter, validator, predicate, parser
+// intrinsic_surface_declarations:
+//   - component: tests/contract_discovery.rs
+//     role: intrinsic-surface
+//     Domain: contract_discovery_proof_surface
+//     Owns:
+//       - discovery contract scenarios
+//       - support harness dependencies for discovery invoke/schema proof
 
 mod support;
 

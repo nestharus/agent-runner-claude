@@ -1,4 +1,11 @@
 // declared_role: orchestration, mapper, accessor, validator, predicate, formatter
+// intrinsic_surface_declarations:
+//   - component: tests/contract_rotation.rs
+//     role: intrinsic-surface
+//     Domain: contract_rotation_proof_surface
+//     Owns:
+//       - rotation contract scenarios
+//       - support harness dependencies for rotation invoke/schema proof
 
 mod support;
 

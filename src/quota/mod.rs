@@ -1,4 +1,11 @@
 // declared_role: orchestration, formatter
+// intrinsic_surface_declarations:
+//   - component: src/quota/mod.rs
+//     role: intrinsic-surface
+//     Domain: quota_capability_module_index
+//     Owns:
+//       - quota capability submodule declaration set
+//       - quota subcommand to handler routing surface
 
 use serde_json::Value;
 

@@ -1,4 +1,11 @@
 // declared_role: orchestration, formatter
+// intrinsic_surface_declarations:
+//   - component: src/rotation/mod.rs
+//     role: intrinsic-surface
+//     Domain: rotation_capability_module_index
+//     Owns:
+//       - rotation capability submodule declaration set
+//       - rotation subcommand to handler routing surface
 
 use serde_json::Value;
 

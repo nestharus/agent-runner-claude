@@ -1,4 +1,11 @@
 // declared_role: orchestration, validator, accessor, parser, formatter, predicate
+// intrinsic_surface_declarations:
+//   - component: tests/contract_launch.rs
+//     role: intrinsic-surface
+//     Domain: contract_launch_proof_surface
+//     Owns:
+//       - launch contract and byte-preservation scenarios
+//       - support harness dependencies for launch invoke/schema/script proof
 
 mod support;
 

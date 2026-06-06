@@ -1,4 +1,11 @@
 // declared_role: orchestration, mapper, accessor, validator, formatter
+// intrinsic_surface_declarations:
+//   - component: tests/contract_quota.rs
+//     role: intrinsic-surface
+//     Domain: contract_quota_proof_surface
+//     Owns:
+//       - quota contract scenarios
+//       - support harness dependencies for quota script/invoke/schema proof
 
 mod support;
 

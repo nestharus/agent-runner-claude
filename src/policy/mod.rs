@@ -1,4 +1,11 @@
 // declared_role: accessor, filter, formatter, mapper, orchestration, parser, predicate, validator
+// intrinsic_surface_declarations:
+//   - component: src/policy/mod.rs
+//     role: intrinsic-surface
+//     Domain: policy_capability_module_index
+//     Owns:
+//       - policy capability submodule declaration set
+//       - policy.evaluate request orchestration surface
 
 pub mod argv;
 pub mod diagnostics;

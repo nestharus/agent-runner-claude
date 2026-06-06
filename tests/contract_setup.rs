@@ -1,4 +1,11 @@
 // declared_role: orchestration, mapper, parser, validator, accessor, predicate, formatter
+// intrinsic_surface_declarations:
+//   - component: tests/contract_setup.rs
+//     role: intrinsic-surface
+//     Domain: contract_setup_proof_surface
+//     Owns:
+//       - setup contract scenarios
+//       - support harness dependencies for setup script/invoke/schema proof
 
 mod support;
 

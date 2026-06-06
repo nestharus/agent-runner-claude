@@ -1,4 +1,11 @@
 // declared_role: validator
+// intrinsic_surface_declarations:
+//   - component: tests/contract_describe_schema.rs
+//     role: intrinsic-surface
+//     Domain: contract_describe_schema_proof_surface
+//     Owns:
+//       - describe/schema contract scenarios
+//       - support harness dependencies for schema validation proof
 
 mod support;
 

@@ -1,4 +1,11 @@
 // declared_role: orchestration, accessor, validator, mapper, parser
+// intrinsic_surface_declarations:
+//   - component: tests/contract_terminal.rs
+//     role: intrinsic-surface
+//     Domain: contract_terminal_proof_surface
+//     Owns:
+//       - terminal contract scenarios
+//       - support harness dependencies for terminal request/invoke/schema proof
 
 mod support;
 

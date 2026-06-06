@@ -1,4 +1,11 @@
 // declared_role: orchestration, formatter
+// intrinsic_surface_declarations:
+//   - component: src/setup/mod.rs
+//     role: intrinsic-surface
+//     Domain: setup_capability_module_index
+//     Owns:
+//       - setup capability submodule declaration set
+//       - setup subcommand to handler routing surface
 
 use serde_json::Value;
 

@@ -1,4 +1,11 @@
 // declared_role: orchestration, mapper, parser, validator, formatter, accessor, filter, predicate
+// intrinsic_surface_declarations:
+//   - component: tests/support/schema.rs
+//     role: intrinsic-surface
+//     Domain: contract_schema_validation_bundle
+//     Owns:
+//       - bundled contract/v1 schema document set
+//       - schema reference rewrite and validation harness surface
 
 use jsonschema::{Draft, JSONSchema};
 use serde_json::{json, Map, Value};

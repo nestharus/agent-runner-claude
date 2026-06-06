@@ -1,4 +1,11 @@
 // declared_role: orchestration, mapper, accessor, validator, formatter, parser
+// intrinsic_surface_declarations:
+//   - component: tests/characterization_session_claude_storage.rs
+//     role: intrinsic-surface
+//     Domain: characterization_session_claude_storage_proof_surface
+//     Owns:
+//       - Claude native transcript storage characterization scenarios
+//       - support harness dependencies for session invoke/schema proof
 
 mod support;
 
@@ -47,7 +54,13 @@ fn transcript_text(lines: &[String]) -> String {
     format!("{}\n", lines.join("\n"))
 }
 
-fn native(session_id: &str, uuid: &str, typ: &str, role: &str, content: Value) -> String {
+fn native_record_value(
+    session_id: &str,
+    uuid: &str,
+    typ: &str,
+    role: &str,
+    content: Value,
+) -> Value {
     json!({
         "sessionId": session_id,
         "uuid": uuid,
@@ -57,7 +70,22 @@ fn native(session_id: &str, uuid: &str, typ: &str, role: &str, content: Value) -
         "parentUuid": null,
         "isSidechain": false
     })
-    .to_string()
+}
+
+fn record_text(record: Value) -> String {
+    record.to_string()
+}
+
+fn native(session_id: &str, uuid: &str, typ: &str, role: &str, content: Value) -> String {
+    record_text(native_record_value(session_id, uuid, typ, role, content))
+}
+
+fn text_content(text: &str) -> Value {
+    json!(text)
+}
+
+fn message_text_content(text: &str) -> Value {
+    json!({ "type": "text", "text": text })
 }
 
 fn encode_b64(bytes: &[u8]) -> String {
@@ -84,8 +112,84 @@ fn encode_b64(bytes: &[u8]) -> String {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    hex_text(&sha256_digest(bytes))
+}
+
+fn sha256_digest(bytes: &[u8]) -> Vec<u8> {
+    Sha256::digest(bytes).to_vec()
+}
+
+fn hex_text(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn locate_transcript_params(session_id: &str) -> Value {
+    json!({ "settings_id": "claude-primary", "session_id": session_id })
+}
+
+fn top_content_record_value() -> Value {
+    json!({
+        "sessionId": "fallback-session",
+        "uuid": "top-content",
+        "timestamp": "2026-06-04T00:00:00.000Z",
+        "type": "user",
+        "content": [{ "type": "text", "text": "top-level content" }]
+    })
+}
+
+fn read_turns_params(session_id: &str) -> Value {
+    json!({ "settings_id": "claude-primary", "session_id": session_id })
+}
+
+fn sidechain_export_record_value() -> Value {
+    json!({
+        "sessionId": "export-session",
+        "uuid": "side",
+        "timestamp": "2026-06-04T00:00:00.000Z",
+        "type": "assistant",
+        "isSidechain": true,
+        "message": { "role": "assistant", "content": "sidechain" }
+    })
+}
+
+fn unsupported_export_record_value() -> Value {
+    json!({
+        "sessionId": "export-session",
+        "uuid": "unsupported",
+        "timestamp": "2026-06-04T00:00:00.000Z",
+        "type": "tool_use",
+        "message": { "content": "unsupported" }
+    })
+}
+
+fn summary_export_record_value() -> Value {
+    json!({
+        "sessionId": "export-session",
+        "uuid": "summary",
+        "timestamp": "2026-06-04T00:00:00.000Z",
+        "type": "system",
+        "isCompactSummary": true,
+        "message": { "content": "summary" }
+    })
+}
+
+fn export_params(session_id: &str) -> Value {
+    json!({ "settings_id": "claude-primary", "session_id": session_id })
+}
+
+fn replace_params(path: String, canonical_data_base64: String, preimage_sha256: String) -> Value {
+    json!({
+        "settings_id": "claude-primary",
+        "session_id": "replace-session",
+        "path": path,
+        "canonical_format": "oulipoly.canonical_transcript/v1",
+        "canonical_transcript": { "kind": "bytes", "data_base64": canonical_data_base64 },
+        "preimage_sha256": preimage_sha256
+    })
+}
+
+fn display_path(path: &Path) -> String {
+    path.display().to_string()
 }
 
 #[test]
@@ -94,7 +198,13 @@ fn claude_native_project_traversal_prefers_exact_session_id_record_not_filename(
     let unrelated = transcript_path(&roots, "-repo-a", "target-session.jsonl");
     write_lines(
         &unrelated,
-        &[native("other", "other-u", "user", "user", json!("wrong"))],
+        &[native(
+            "other",
+            "other-u",
+            "user",
+            "user",
+            text_content("wrong"),
+        )],
     );
     let expected = transcript_path(&roots, "-repo-b", "random-name.jsonl");
     write_lines(
@@ -104,14 +214,14 @@ fn claude_native_project_traversal_prefers_exact_session_id_record_not_filename(
             "target-u",
             "user",
             "user",
-            json!("right"),
+            text_content("right"),
         )],
     );
 
     let (code, response) = call(
         &roots,
         "session.locate_transcript",
-        json!({ "settings_id": "claude-primary", "session_id": "target-session" }),
+        locate_transcript_params("target-session"),
     );
     assert_locate_response(code, &response, &expected);
 }
@@ -133,20 +243,13 @@ fn claude_native_content_fallback_and_turn_normalization_are_pinned() {
     write_lines(
         &path,
         &[
-            json!({
-                "sessionId": "fallback-session",
-                "uuid": "top-content",
-                "timestamp": "2026-06-04T00:00:00.000Z",
-                "type": "user",
-                "content": [{ "type": "text", "text": "top-level content" }]
-            })
-            .to_string(),
+            record_text(top_content_record_value()),
             native(
                 "fallback-session",
                 "message-content",
                 "assistant",
                 "assistant",
-                json!({ "type": "text", "text": "message object" }),
+                message_text_content("message object"),
             ),
         ],
     );
@@ -154,7 +257,7 @@ fn claude_native_content_fallback_and_turn_normalization_are_pinned() {
     let (code, response) = call(
         &roots,
         "session.read_turns",
-        json!({ "settings_id": "claude-primary", "session_id": "fallback-session" }),
+        read_turns_params("fallback-session"),
     );
     assert_read_turns_response(code, &response);
 }
@@ -183,20 +286,28 @@ fn claude_native_canonical_export_fixture_and_sha_skip_sidechain_and_unsupported
     write_lines(
         &path,
         &[
-            native("export-session", "u1", "user", "user", json!("first")),
-            json!({ "sessionId": "export-session", "uuid": "side", "timestamp": "2026-06-04T00:00:00.000Z", "type": "assistant", "isSidechain": true, "message": { "role": "assistant", "content": "sidechain" } }).to_string(),
-            json!({ "sessionId": "export-session", "uuid": "unsupported", "timestamp": "2026-06-04T00:00:00.000Z", "type": "tool_use", "message": { "content": "unsupported" } }).to_string(),
-            json!({ "sessionId": "export-session", "uuid": "summary", "timestamp": "2026-06-04T00:00:00.000Z", "type": "system", "isCompactSummary": true, "message": { "content": "summary" } }).to_string(),
-            native("export-session", "u2", "assistant", "assistant", json!("second")),
+            native(
+                "export-session",
+                "u1",
+                "user",
+                "user",
+                text_content("first"),
+            ),
+            record_text(sidechain_export_record_value()),
+            record_text(unsupported_export_record_value()),
+            record_text(summary_export_record_value()),
+            native(
+                "export-session",
+                "u2",
+                "assistant",
+                "assistant",
+                text_content("second"),
+            ),
         ],
     );
     let expected = expected_canonical_export_bytes();
 
-    let (code, response) = call(
-        &roots,
-        "session.export",
-        json!({ "settings_id": "claude-primary", "session_id": "export-session" }),
-    );
+    let (code, response) = call(&roots, "session.export", export_params("export-session"));
     assert_export_response(code, &response, expected);
 }
 
@@ -232,14 +343,11 @@ fn claude_native_replace_renders_back_to_jsonl_record_shape() {
     let (code, response) = call(
         &roots,
         "session.replace",
-        json!({
-            "settings_id": "claude-primary",
-            "session_id": "replace-session",
-            "path": path.display().to_string(),
-            "canonical_format": "oulipoly.canonical_transcript/v1",
-            "canonical_transcript": { "kind": "bytes", "data_base64": encode_b64(canonical) },
-            "preimage_sha256": sha256_hex(original.as_bytes())
-        }),
+        replace_params(
+            display_path(&path),
+            encode_b64(canonical),
+            sha256_hex(original.as_bytes()),
+        ),
     );
     assert_replace_response(code, &response, &path);
 }
@@ -247,7 +355,13 @@ fn claude_native_replace_renders_back_to_jsonl_record_shape() {
 fn original_replace_transcript() -> String {
     format!(
         "{}\n",
-        native("replace-session", "old", "user", "user", json!("old"))
+        native(
+            "replace-session",
+            "old",
+            "user",
+            "user",
+            text_content("old")
+        )
     )
 }
 

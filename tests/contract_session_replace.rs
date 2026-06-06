@@ -1,4 +1,11 @@
 // declared_role: orchestration, formatter, parser, validator, accessor, predicate, mapper
+// intrinsic_surface_declarations:
+//   - component: tests/contract_session_replace.rs
+//     role: intrinsic-surface
+//     Domain: contract_session_replace_proof_surface
+//     Owns:
+//       - session replace contract scenarios
+//       - support harness dependencies for session request/invoke/schema proof
 
 mod support;
 

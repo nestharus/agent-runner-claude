@@ -1,4 +1,11 @@
 // declared_role: orchestration, validator, predicate, mapper, accessor, formatter
+// intrinsic_surface_declarations:
+//   - component: src/launch/mod.rs
+//     role: intrinsic-surface
+//     Domain: launch_capability_module_index
+//     Owns:
+//       - launch capability submodule declaration set
+//       - launch request dispatch and pre-spawn stream surface
 
 pub mod child;
 pub mod drain;

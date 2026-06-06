@@ -1,4 +1,11 @@
 // declared_role: orchestration, mapper, validator, formatter, accessor
+// intrinsic_surface_declarations:
+//   - component: tests/characterization_quota_anthropic.rs
+//     role: intrinsic-surface
+//     Domain: characterization_quota_anthropic_proof_surface
+//     Owns:
+//       - Anthropic quota output characterization scenarios
+//       - support harness dependencies for quota script/invoke/schema proof
 
 mod support;
 
@@ -56,8 +63,23 @@ fn quota_probe_params(context: Value) -> Value {
     })
 }
 
+fn quota_script_context(script: &Path) -> Value {
+    json!({ "quota_script": path_string(script) })
+}
+
+fn empty_after_prior_context(script: &Path) -> Value {
+    json!({
+        "quota_script": path_string(script),
+        "prior_windows": [{
+            "name": "weekly",
+            "remaining_ratio": 0.5,
+            "resets_at_unix_ms": WEEKLY_RESET_MS
+        }]
+    })
+}
+
 fn success_probe(roots: &TempRoots, script: &Path) -> Value {
-    let output = quota_probe(roots, json!({ "quota_script": path_string(script) }));
+    let output = quota_probe(roots, quota_script_context(script));
     assert_success_probe_output(&output);
     let response = parse_one_stdout_json(&output);
     assert_valid("quota.schema.json#/$defs/QuotaProbeResponse", &response);
@@ -155,10 +177,7 @@ fn anthropic_usage_rejects_used_percent_outside_zero_to_one_hundred() {
         let roots = temp_roots(label);
         let script = roots.root.join("anthropic-usage.sh");
         write_script(&script, &out_of_range_quota_fixture(used_percent), "");
-        let response = assert_error(quota_probe(
-            &roots,
-            json!({ "quota_script": path_string(&script) }),
-        ));
+        let response = assert_error(quota_probe(&roots, quota_script_context(&script)));
         assert_parse_failed_error(&response);
     }
 }
@@ -198,13 +217,7 @@ fn anthropic_usage_empty_after_prior_data_is_refresh_recommended() {
     let script = roots.root.join("anthropic-usage.sh");
     write_script(&script, r#"{ "windows": [] }"#, "");
 
-    let output = quota_probe(
-        &roots,
-        json!({
-            "quota_script": path_string(&script),
-            "prior_windows": [{ "name": "weekly", "remaining_ratio": 0.5, "resets_at_unix_ms": WEEKLY_RESET_MS }]
-        }),
-    );
+    let output = quota_probe(&roots, empty_after_prior_context(&script));
     let response = assert_error(output);
     assert_empty_after_prior_error(&response);
 }

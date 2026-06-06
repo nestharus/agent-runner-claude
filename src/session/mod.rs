@@ -1,4 +1,11 @@
 // declared_role: orchestration, formatter
+// intrinsic_surface_declarations:
+//   - component: src/session/mod.rs
+//     role: intrinsic-surface
+//     Domain: session_capability_module_index
+//     Owns:
+//       - session capability submodule declaration set
+//       - session subcommand to handler routing surface
 
 use serde_json::Value;
 

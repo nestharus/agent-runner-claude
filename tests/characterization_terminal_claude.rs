@@ -1,4 +1,11 @@
-// declared_role: orchestration, accessor, validator
+// declared_role: orchestration, accessor, validator, mapper
+// intrinsic_surface_declarations:
+//   - component: tests/characterization_terminal_claude.rs
+//     role: intrinsic-surface
+//     Domain: characterization_terminal_claude_proof_surface
+//     Owns:
+//       - Claude terminal characterization scenarios
+//       - support harness dependencies for terminal request/invoke/schema proof
 
 mod support;
 
@@ -28,13 +35,29 @@ fn kind(response: &Value) -> &str {
         .unwrap()
 }
 
+fn clean_exit_status() -> Value {
+    json!({ "kind": "exited", "code": 0 })
+}
+
+fn spawn_error_status() -> Value {
+    json!({ "kind": "spawn_error", "reason": "No such file" })
+}
+
+fn cancelled_status() -> Value {
+    json!({ "kind": "cancelled" })
+}
+
+fn nonzero_exit_status() -> Value {
+    json!({ "kind": "exited", "code": 1 })
+}
+
+fn long_stdout_fixture() -> Vec<u8> {
+    vec![b'x'; 4096]
+}
+
 #[test]
 fn claude_terminal_clean_exit_precedes_quota_text() {
-    let response = classify(
-        b"",
-        b"Claude usage limit reached",
-        json!({ "kind": "exited", "code": 0 }),
-    );
+    let response = classify(b"", b"Claude usage limit reached", clean_exit_status());
     assert_terminal_kind(&response, "clean_exit");
 }
 
@@ -43,14 +66,14 @@ fn claude_terminal_spawn_error_and_cancelled_status_precede_output_text() {
     let spawn = classify(
         b"Claude usage limit reached",
         b"429 Too Many Requests",
-        json!({ "kind": "spawn_error", "reason": "No such file" }),
+        spawn_error_status(),
     );
     assert_terminal_kind(&spawn, "spawn_error");
 
     let cancelled = classify(
         b"Claude usage limit reached",
         b"429 Too Many Requests",
-        json!({ "kind": "cancelled" }),
+        cancelled_status(),
     );
     assert_terminal_kind(&cancelled, "cancelled");
 }
@@ -61,12 +84,8 @@ fn assert_terminal_kind(response: &Value, expected: &str) {
 
 #[test]
 fn claude_terminal_evidence_is_bounded_and_uses_contract_vocabulary() {
-    let long = vec![b'x'; 4096];
-    let response = classify(
-        &long,
-        b"Claude usage limit reached",
-        json!({ "kind": "exited", "code": 1 }),
-    );
+    let long = long_stdout_fixture();
+    let response = classify(&long, b"Claude usage limit reached", nonzero_exit_status());
     assert_terminal_vocabulary_and_evidence(&response);
 }
 

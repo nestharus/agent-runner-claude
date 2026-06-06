@@ -1,4 +1,11 @@
 // declared_role: orchestration, mapper, accessor, validator, predicate
+// intrinsic_surface_declarations:
+//   - component: tests/contract_migration.rs
+//     role: intrinsic-surface
+//     Domain: contract_migration_proof_surface
+//     Owns:
+//       - migration contract scenarios
+//       - support harness dependencies for migration invoke/schema proof
 
 mod support;
 

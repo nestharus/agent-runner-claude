@@ -5,6 +5,13 @@
 //     Owns:
 //       - provider subcommand to capability handler routing table
 //       - unsupported subcommand provider failure surface
+// intrinsic_surface_declarations:
+//   - component: src/dispatch/router.rs
+//     role: intrinsic-surface
+//     Domain: provider_subcommand_routing
+//     Owns:
+//       - provider subcommand to capability handler routing table
+//       - unsupported subcommand provider failure surface
 
 use serde_json::Value;
 

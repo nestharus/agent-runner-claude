@@ -1,4 +1,11 @@
 // declared_role: orchestration, accessor, filter, mapper, validator
+// intrinsic_surface_declarations:
+//   - component: tests/characterization_policy_claude.rs
+//     role: intrinsic-surface
+//     Domain: characterization_policy_claude_proof_surface
+//     Owns:
+//       - Claude policy characterization scenarios
+//       - support harness dependencies for policy request/invoke/schema proof
 
 mod support;
 
@@ -48,17 +55,118 @@ fn owned_code(code: &str) -> String {
     code.to_string()
 }
 
+fn prompt_fixture(text: &str) -> Value {
+    json!(text)
+}
+
+fn append_system_prompt_launch_fixture() -> Value {
+    json!({
+        "command": "claude",
+        "args": [],
+        "prompt_mode": "arg",
+        "invocation_mode": "proxy",
+        "system_prompt_override": "follow host policy"
+    })
+}
+
+fn allowed_tools_launch_fixture() -> Value {
+    json!({
+        "command": "claude",
+        "args": [],
+        "prompt_mode": "arg",
+        "invocation_mode": "proxy",
+        "tool_restrictions": {
+            "kind": "claude",
+            "claude": { "allowed_tools": ["Read", "Bash", "mcp__github__search"] }
+        }
+    })
+}
+
+fn disallowed_tools_launch_fixture() -> Value {
+    json!({
+        "command": "claude",
+        "args": [],
+        "prompt_mode": "arg",
+        "invocation_mode": "proxy",
+        "tool_restrictions": {
+            "kind": "claude",
+            "claude": { "disallowed_tools": ["Write", "WebFetch"] }
+        }
+    })
+}
+
+fn disable_slash_commands_launch_fixture() -> Value {
+    json!({
+        "command": "claude",
+        "args": [],
+        "prompt_mode": "arg",
+        "invocation_mode": "proxy",
+        "tool_restrictions": {
+            "kind": "claude",
+            "claude": { "disable_slash_commands": true }
+        }
+    })
+}
+
+fn duplicate_policy_launch_fixture() -> Value {
+    json!({
+        "command": "claude --append-system-prompt existing --allowed-tools Read --disable-slash-commands",
+        "args": [],
+        "prompt_mode": "arg",
+        "invocation_mode": "proxy",
+        "system_prompt_override": "new policy",
+        "tool_restrictions": {
+            "kind": "claude",
+            "claude": { "allowed_tools": ["Bash"], "disable_slash_commands": true }
+        }
+    })
+}
+
+fn rejected_proxy_launch_fixture() -> Value {
+    json!({
+        "command": "claude",
+        "args": ["--tools", "mcp__danger__run"],
+        "prompt_mode": "arg",
+        "invocation_mode": "proxy"
+    })
+}
+
+fn permitted_proxy_launch_fixture() -> Value {
+    json!({
+        "command": "claude",
+        "args": [],
+        "prompt_mode": "arg",
+        "invocation_mode": "proxy",
+        "tool_restrictions": {
+            "kind": "claude",
+            "claude": { "allowed_tools": ["mcp__safe__read"] }
+        }
+    })
+}
+
+fn arg_prompt_launch_fixture() -> Value {
+    json!({
+        "command": "claude",
+        "args": [],
+        "prompt_mode": "arg",
+        "invocation_mode": "proxy"
+    })
+}
+
+fn stdin_prompt_launch_fixture() -> Value {
+    json!({
+        "command": "claude --print",
+        "args": [],
+        "prompt_mode": "stdin",
+        "invocation_mode": "headless"
+    })
+}
+
 #[test]
 fn claude_append_system_prompt_projects_to_exact_argv_pair() {
     let response = policy_with(
-        json!("prompt"),
-        json!({
-            "command": "claude",
-            "args": [],
-            "prompt_mode": "arg",
-            "invocation_mode": "proxy",
-            "system_prompt_override": "follow host policy"
-        }),
+        prompt_fixture("prompt"),
+        append_system_prompt_launch_fixture(),
     );
     assert_append_system_prompt_response(&response);
 }
@@ -78,34 +186,10 @@ fn assert_append_system_prompt_response(response: &Value) {
 
 #[test]
 fn claude_allowed_and_disallowed_tools_are_projected_as_comma_joined_flags() {
-    let allowed = policy_with(
-        json!("prompt"),
-        json!({
-            "command": "claude",
-            "args": [],
-            "prompt_mode": "arg",
-            "invocation_mode": "proxy",
-            "tool_restrictions": {
-                "kind": "claude",
-                "claude": { "allowed_tools": ["Read", "Bash", "mcp__github__search"] }
-            }
-        }),
-    );
+    let allowed = policy_with(prompt_fixture("prompt"), allowed_tools_launch_fixture());
     assert_allowed_tools_response(&allowed);
 
-    let disallowed = policy_with(
-        json!("prompt"),
-        json!({
-            "command": "claude",
-            "args": [],
-            "prompt_mode": "arg",
-            "invocation_mode": "proxy",
-            "tool_restrictions": {
-                "kind": "claude",
-                "claude": { "disallowed_tools": ["Write", "WebFetch"] }
-            }
-        }),
-    );
+    let disallowed = policy_with(prompt_fixture("prompt"), disallowed_tools_launch_fixture());
     assert_disallowed_tools_response(&disallowed);
 }
 
@@ -131,17 +215,8 @@ fn assert_disallowed_tools_response(response: &Value) {
 #[test]
 fn claude_disable_slash_commands_projects_to_flag_without_value() {
     let response = policy_with(
-        json!("prompt"),
-        json!({
-            "command": "claude",
-            "args": [],
-            "prompt_mode": "arg",
-            "invocation_mode": "proxy",
-            "tool_restrictions": {
-                "kind": "claude",
-                "claude": { "disable_slash_commands": true }
-            }
-        }),
+        prompt_fixture("prompt"),
+        disable_slash_commands_launch_fixture(),
     );
     assert_disable_slash_commands_response(&response);
 }
@@ -155,20 +230,7 @@ fn assert_disable_slash_commands_response(response: &Value) {
 
 #[test]
 fn claude_duplicate_detection_reports_existing_cli_policy_flags() {
-    let response = policy_with(
-        json!("prompt"),
-        json!({
-            "command": "claude --append-system-prompt existing --allowed-tools Read --disable-slash-commands",
-            "args": [],
-            "prompt_mode": "arg",
-            "invocation_mode": "proxy",
-            "system_prompt_override": "new policy",
-            "tool_restrictions": {
-                "kind": "claude",
-                "claude": { "allowed_tools": ["Bash"], "disable_slash_commands": true }
-            }
-        }),
-    );
+    let response = policy_with(prompt_fixture("prompt"), duplicate_policy_launch_fixture());
     assert_duplicate_policy_diagnostics(&response);
 }
 
@@ -182,30 +244,10 @@ fn assert_duplicate_policy_diagnostics(response: &Value) {
 
 #[test]
 fn claude_proxy_rejects_raw_tools_mcp_restriction_but_not_allowed_tools_mcp_names() {
-    let rejected = policy_with(
-        json!("prompt"),
-        json!({
-            "command": "claude",
-            "args": ["--tools", "mcp__danger__run"],
-            "prompt_mode": "arg",
-            "invocation_mode": "proxy"
-        }),
-    );
+    let rejected = policy_with(prompt_fixture("prompt"), rejected_proxy_launch_fixture());
     assert_proxy_rejected_response(&rejected);
 
-    let permitted = policy_with(
-        json!("prompt"),
-        json!({
-            "command": "claude",
-            "args": [],
-            "prompt_mode": "arg",
-            "invocation_mode": "proxy",
-            "tool_restrictions": {
-                "kind": "claude",
-                "claude": { "allowed_tools": ["mcp__safe__read"] }
-            }
-        }),
-    );
+    let permitted = policy_with(prompt_fixture("prompt"), permitted_proxy_launch_fixture());
     assert_proxy_permitted_response(&permitted);
 }
 
@@ -220,16 +262,10 @@ fn assert_proxy_permitted_response(response: &Value) {
 
 #[test]
 fn claude_prompt_and_stdin_projection_are_mutually_explicit() {
-    let arg = policy_with(
-        json!("hello arg"),
-        json!({ "command": "claude", "args": [], "prompt_mode": "arg", "invocation_mode": "proxy" }),
-    );
+    let arg = policy_with(prompt_fixture("hello arg"), arg_prompt_launch_fixture());
     assert_arg_prompt_response(&arg);
 
-    let stdin = policy_with(
-        json!("hello stdin"),
-        json!({ "command": "claude --print", "args": [], "prompt_mode": "stdin", "invocation_mode": "headless" }),
-    );
+    let stdin = policy_with(prompt_fixture("hello stdin"), stdin_prompt_launch_fixture());
     assert_stdin_prompt_response(&stdin);
 }
 

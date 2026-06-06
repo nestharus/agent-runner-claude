@@ -1,4 +1,11 @@
 // declared_role: orchestration, mapper, formatter, validator, accessor
+// intrinsic_surface_declarations:
+//   - component: tests/contract_session_read_turns.rs
+//     role: intrinsic-surface
+//     Domain: contract_session_read_turns_proof_surface
+//     Owns:
+//       - session read-turns contract scenarios
+//       - support harness dependencies for session invoke/schema proof
 
 mod support;
 

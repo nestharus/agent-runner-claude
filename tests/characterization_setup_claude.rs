@@ -1,11 +1,18 @@
 // declared_role: orchestration, mapper, accessor, validator, formatter, predicate, parser
+// intrinsic_surface_declarations:
+//   - component: tests/characterization_setup_claude.rs
+//     role: intrinsic-surface
+//     Domain: characterization_setup_claude_proof_surface
+//     Owns:
+//       - Claude setup characterization scenarios
+//       - support harness dependencies for setup invoke/schema proof
 
 mod support;
 
 use serde_json::{json, Value};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use support::fixtures::{envelope, host_context, temp_roots, TempRoots, CONTRACT};
 use support::invoke::{invoke, parse_one_stdout_json};
 use support::schema::assert_valid;
@@ -69,6 +76,10 @@ fn parse_argv_text(text: &str) -> Vec<String> {
     text.lines().map(str::to_string).collect()
 }
 
+fn parse_schema_arg(text: &str) -> Value {
+    serde_json::from_str::<Value>(text).expect("schema arg must be JSON")
+}
+
 fn assert_no_secret(value: &Value, stdout: &[u8], stderr: &[u8]) {
     assert!(!value.to_string().contains(SECRET));
     assert!(!String::from_utf8_lossy(stdout).contains(SECRET));
@@ -84,6 +95,51 @@ fn has_string(value: &Value, needle: &str) -> bool {
     }
 }
 
+fn setup_brain_params(prompt: &str) -> Value {
+    json!({ "prompt": prompt })
+}
+
+fn setup_brain_resume_params(prompt: &str, resume: &str) -> Value {
+    json!({ "prompt": prompt, "resume": resume })
+}
+
+fn claude_home_dir(roots: &TempRoots) -> PathBuf {
+    roots.home.join(".claude")
+}
+
+fn personal_profile_dir(claude_home: &Path) -> PathBuf {
+    claude_home.join("profiles/personal")
+}
+
+fn credentials_path(claude_home: &Path) -> PathBuf {
+    claude_home.join("credentials.json")
+}
+
+fn personal_profile_settings_path(claude_home: &Path) -> PathBuf {
+    claude_home.join("profiles/personal/settings.json")
+}
+
+fn existing_skill_path(roots: &TempRoots) -> PathBuf {
+    roots.home.join(".claude/skills/existing/SKILL.md")
+}
+
+fn root_claude_json_path(roots: &TempRoots) -> PathBuf {
+    roots.home.join(".claude.json")
+}
+
+fn setup_sync_params() -> Value {
+    json!({
+        "skills": [{ "name": "existing", "body": "provider replacement" }],
+        "mcp_servers": [{ "name": "existing", "command": "agent-runner-claude mcp" }],
+        "config": { "permissions": { "allow": ["Read", "Bash"] } },
+        "overwrite": false
+    })
+}
+
+fn empty_params() -> Value {
+    json!({})
+}
+
 #[test]
 fn fixture_claude_pins_setup_brain_argv_stdout_stderr_and_session_prefixes() {
     let roots = temp_roots("char-setup-brain");
@@ -97,11 +153,8 @@ fn fixture_claude_pins_setup_brain_argv_stdout_stderr_and_session_prefixes() {
     );
     let host = host_with_path(&roots, &bin_dir);
     let prompt = "characterize setup brain default";
-    let (response, stdout, stderr) = call(
-        host.clone(),
-        "setup_brain.turn",
-        json!({ "prompt": prompt }),
-    );
+    let (response, stdout, stderr) =
+        call(host.clone(), "setup_brain.turn", setup_brain_params(prompt));
     assert_default_setup_brain_response(&response, &stdout, &stderr, &argv_default, prompt);
 
     let argv_resume = roots.root.join("argv-resume.txt");
@@ -115,7 +168,7 @@ fn fixture_claude_pins_setup_brain_argv_stdout_stderr_and_session_prefixes() {
     let (response, stdout, stderr) = call(
         host,
         "setup_brain.turn",
-        json!({ "prompt": resume_prompt, "resume": "char-session-default" }),
+        setup_brain_resume_params(resume_prompt, "char-session-default"),
     );
     assert_resume_setup_brain_response(&response, &stdout, &stderr, &argv_resume, resume_prompt);
 }
@@ -148,7 +201,8 @@ fn assert_default_setup_brain_response(
         ]
     );
     assert_eq!(captured[8], "--json-schema");
-    serde_json::from_str::<Value>(&captured[9]).expect("schema arg must be JSON");
+    let schema_arg = parse_schema_arg(&captured[9]);
+    assert!(schema_arg.is_object());
     assert_eq!(captured.last().unwrap(), prompt);
     assert_no_secret(response, stdout, stderr);
 }
@@ -183,17 +237,17 @@ fn setup_detect_characterizes_claude_home_layout_auth_metadata_redaction_and_pro
         &bin_dir.join("claude"),
         "#!/bin/sh\nprintf 'Claude Code 9.9.9\\n'\n",
     );
-    let claude_home = roots.home.join(".claude");
-    fs::create_dir_all(claude_home.join("profiles/personal")).unwrap();
-    fs::write(claude_home.join("credentials.json"), credentials_fixture()).unwrap();
+    let claude_home = claude_home_dir(&roots);
+    fs::create_dir_all(personal_profile_dir(&claude_home)).unwrap();
+    fs::write(credentials_path(&claude_home), credentials_fixture()).unwrap();
     fs::write(
-        claude_home.join("profiles/personal/settings.json"),
+        personal_profile_settings_path(&claude_home),
         profile_fixture(),
     )
     .unwrap();
 
     let host = host_with_path(&roots, &bin_dir);
-    let (response, stdout, stderr) = call(host, "setup.detect", json!({}));
+    let (response, stdout, stderr) = call(host, "setup.detect", empty_params());
     assert_setup_detect_response(&response, &stdout, &stderr);
 }
 
@@ -228,23 +282,15 @@ fn assert_setup_detect_response(response: &Value, stdout: &[u8], stderr: &[u8]) 
 #[test]
 fn setup_sync_characterizes_skills_mcp_config_plans_and_no_overwrite_conflicts() {
     let roots = temp_roots("char-setup-sync");
-    let skill = roots.home.join(".claude/skills/existing/SKILL.md");
-    let claude_json_path = roots.home.join(".claude.json");
+    let skill = existing_skill_path(&roots);
+    let claude_json_path = root_claude_json_path(&roots);
     fs::create_dir_all(skill.parent().unwrap()).unwrap();
     fs::write(&skill, "USER_EXISTING_SKILL").unwrap();
     let claude_json_sentinel = claude_json_sentinel();
     fs::write(&claude_json_path, &claude_json_sentinel).unwrap();
 
-    let (response, stdout, stderr) = call(
-        host_context(&roots),
-        "setup.sync_plan",
-        json!({
-            "skills": [{ "name": "existing", "body": "provider replacement" }],
-            "mcp_servers": [{ "name": "existing", "command": "agent-runner-claude mcp" }],
-            "config": { "permissions": { "allow": ["Read", "Bash"] } },
-            "overwrite": false
-        }),
-    );
+    let (response, stdout, stderr) =
+        call(host_context(&roots), "setup.sync_plan", setup_sync_params());
     assert_setup_sync_response(
         &response,
         &stdout,

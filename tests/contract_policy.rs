@@ -1,4 +1,11 @@
 // declared_role: orchestration, mapper, accessor, filter, validator, parser
+// intrinsic_surface_declarations:
+//   - component: tests/contract_policy.rs
+//     role: intrinsic-surface
+//     Domain: contract_policy_proof_surface
+//     Owns:
+//       - policy contract scenarios
+//       - support harness dependencies for policy request/invoke/schema proof
 
 mod support;
 

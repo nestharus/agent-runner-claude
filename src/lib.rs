@@ -5,6 +5,13 @@
 //     Owns:
 //       - crate module declaration set for provider capability families
 //       - public provider CLI run surface
+// intrinsic_surface_declarations:
+//   - component: src/lib.rs
+//     role: intrinsic-surface
+//     Domain: provider_cli_crate_root
+//     Owns:
+//       - crate module declaration set for provider capability families
+//       - public provider CLI run surface
 
 use std::io::{Read, Write};
 use std::process::ExitCode;

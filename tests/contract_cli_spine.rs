@@ -1,4 +1,11 @@
 // declared_role: orchestration, mapper, parser, validator
+// intrinsic_surface_declarations:
+//   - component: tests/contract_cli_spine.rs
+//     role: intrinsic-surface
+//     Domain: contract_cli_spine_proof_surface
+//     Owns:
+//       - CLI spine contract scenarios
+//       - support harness dependencies for provider invocation/schema proof
 
 mod support;
 
