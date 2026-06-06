@@ -133,10 +133,12 @@ fn migration_plan_returns_provider_owned_actions_backup_confirmation_warnings_an
     let legacy_config = roots.home.join(".claude.json");
     let provider_file = roots.home.join(".claude/settings.json");
     let central_state = roots.data_root.join("central-state.sqlite");
+    let central_journal = roots.data_root.join("central-state.sqlite-journal");
     fs::create_dir_all(provider_file.parent().unwrap()).unwrap();
     write(&legacy_config, "LEGACY_CONFIG_SENTINEL");
     write(&provider_file, "PROVIDER_FILE_SENTINEL");
     write(&central_state, "CENTRAL_STATE_PLAN_SENTINEL");
+    write(&central_journal, "CENTRAL_JOURNAL_PLAN_SENTINEL");
 
     let response = call(
         &roots,
@@ -144,7 +146,12 @@ fn migration_plan_returns_provider_owned_actions_backup_confirmation_warnings_an
         migration_plan_params(&roots, &central_state),
     );
     assert_migration_plan_response(&response);
-    assert_migration_plan_sentinels(&legacy_config, &provider_file, &central_state);
+    assert_migration_plan_sentinels(
+        &legacy_config,
+        &provider_file,
+        &central_state,
+        &central_journal,
+    );
 }
 
 fn migration_plan_params(roots: &TempRoots, central_state: &Path) -> Value {
@@ -185,10 +192,12 @@ fn assert_migration_plan_sentinels(
     legacy_config: &Path,
     provider_file: &Path,
     central_state: &Path,
+    central_journal: &Path,
 ) {
     assert_file(legacy_config, "LEGACY_CONFIG_SENTINEL");
     assert_file(provider_file, "PROVIDER_FILE_SENTINEL");
     assert_file(central_state, "CENTRAL_STATE_PLAN_SENTINEL");
+    assert_file(central_journal, "CENTRAL_JOURNAL_PLAN_SENTINEL");
 }
 
 #[test]
@@ -207,21 +216,25 @@ fn migration_plan_malformed_request_uses_capability_error_def() {
 fn migration_plan_rejects_provider_root_outside_declared_roots_even_when_name_contains_claude() {
     let roots = temp_roots("migration-plan-root-confinement");
     let hostile_root = roots.root.join("host-owned-claude-looking-root");
+    let central_state = roots.data_root.join("central-state.sqlite");
+    let central_journal = roots.data_root.join("central-state.sqlite-journal");
     fs::create_dir_all(&hostile_root).expect("create hostile root");
     let sentinel = hostile_root.join("settings.v1.json");
     write(&sentinel, "HOSTILE_ROOT_SENTINEL");
+    write(&central_state, "CENTRAL_STATE_REJECTED_PLAN_SENTINEL");
+    write(&central_journal, "CENTRAL_JOURNAL_REJECTED_PLAN_SENTINEL");
 
     let response = call_error_category(
         &roots,
         "migration.plan",
-        hostile_root_plan_params(&hostile_root),
+        hostile_root_plan_params(&hostile_root, &central_state),
         "migration.schema.json#/$defs/MigrationPlanErrorResponse",
         "conflict",
     );
-    assert_provider_root_rejection(&response, &sentinel);
+    assert_provider_root_rejection(&response, &sentinel, &central_state, &central_journal);
 }
 
-fn hostile_root_plan_params(hostile_root: &Path) -> Value {
+fn hostile_root_plan_params(hostile_root: &Path, central_state: &Path) -> Value {
     json!({
         "from": "legacy-host-state",
         "to": "claude.settings/v1",
@@ -229,16 +242,24 @@ fn hostile_root_plan_params(hostile_root: &Path) -> Value {
         "legacy": {
             "providers.toml": { "claude-primary": { "command": "claude" } },
             "sessions.toml": { "claude-primary": { "turn_script": "turns" } }
-        }
+        },
+        "central_state": central_state.display().to_string()
     })
 }
 
-fn assert_provider_root_rejection(response: &Value, sentinel: &Path) {
+fn assert_provider_root_rejection(
+    response: &Value,
+    sentinel: &Path,
+    central_state: &Path,
+    central_journal: &Path,
+) {
     assert_eq!(
         response["error"]["code"],
         "migration_provider_root_outside_provider_root"
     );
     assert_file(sentinel, "HOSTILE_ROOT_SENTINEL");
+    assert_file(central_state, "CENTRAL_STATE_REJECTED_PLAN_SENTINEL");
+    assert_file(central_journal, "CENTRAL_JOURNAL_REJECTED_PLAN_SENTINEL");
 }
 
 #[test]
@@ -247,7 +268,12 @@ fn migration_apply_only_performs_confirmed_provider_owned_actions_and_leaves_hos
     let provider_root = roots.home.join(".claude");
     fs::create_dir_all(&provider_root).unwrap();
     let central_state = roots.data_root.join("central-state.sqlite");
+    let central_journal = roots.data_root.join("central-state.sqlite-journal");
     write(&central_state, "CENTRAL_STATE_SENTINEL_BEFORE_MIGRATION");
+    write(
+        &central_journal,
+        "CENTRAL_JOURNAL_SENTINEL_BEFORE_MIGRATION",
+    );
     let confirmed_provider_file = provider_root.join("settings.v1.json");
     let unconfirmed_provider_file = provider_root.join("unconfirmed.json");
     write(&unconfirmed_provider_file, "UNCONFIRMED_PROVIDER_SENTINEL");
@@ -259,6 +285,7 @@ fn migration_apply_only_performs_confirmed_provider_owned_actions_and_leaves_hos
             &roots,
             &provider_root,
             &central_state,
+            &central_journal,
             &unconfirmed_provider_file,
         ),
     );
@@ -268,13 +295,14 @@ fn migration_apply_only_performs_confirmed_provider_owned_actions_and_leaves_hos
         &confirmed_provider_file,
         "{\"provider\":\"claude\"}",
     );
-    assert_migration_apply_sentinels(&central_state, &unconfirmed_provider_file);
+    assert_migration_apply_sentinels(&central_state, &central_journal, &unconfirmed_provider_file);
 }
 
 fn migration_apply_params(
     roots: &TempRoots,
     provider_root: &Path,
     central_state: &Path,
+    central_journal: &Path,
     unconfirmed_provider_file: &Path,
 ) -> Value {
     json!({
@@ -296,6 +324,12 @@ fn migration_apply_params(
                 "provider_owned": false,
                 "path": central_state.display().to_string(),
                 "content": { "encoding": "utf8", "data": "SHOULD_NOT_BE_WRITTEN" }
+            },
+            {
+                "kind": "write_file",
+                "provider_owned": false,
+                "path": central_journal.display().to_string(),
+                "content": { "encoding": "utf8", "data": "SHOULD_NOT_BE_WRITTEN_TO_JOURNAL" }
             },
             {
                 "kind": "write_file",
@@ -333,8 +367,13 @@ fn assert_migration_apply_response(response: &Value) {
     assert!(has_string(&result["outcome"], "applied") || result["outcome"].is_object());
 }
 
-fn assert_migration_apply_sentinels(central_state: &Path, unconfirmed_provider_file: &Path) {
+fn assert_migration_apply_sentinels(
+    central_state: &Path,
+    central_journal: &Path,
+    unconfirmed_provider_file: &Path,
+) {
     assert_file(central_state, "CENTRAL_STATE_SENTINEL_BEFORE_MIGRATION");
+    assert_file(central_journal, "CENTRAL_JOURNAL_SENTINEL_BEFORE_MIGRATION");
     assert_file(unconfirmed_provider_file, "UNCONFIRMED_PROVIDER_SENTINEL");
 }
 
@@ -356,19 +395,25 @@ fn assert_migration_apply_wrote_provider_file(response: &Value, path: &Path, exp
 fn migration_apply_rejects_provider_owned_claim_for_host_path_and_leaves_sentinel_unchanged() {
     let roots = temp_roots("migration-apply-host-path-confinement");
     let central_state = roots.data_root.join("central-state.sqlite");
+    let central_journal = roots.data_root.join("central-state.sqlite-journal");
     write(&central_state, "HOST_CENTRAL_STATE_SENTINEL");
+    write(&central_journal, "HOST_CENTRAL_JOURNAL_SENTINEL");
 
     let response = call_error_category(
         &roots,
         "migration.apply",
-        host_path_apply_params(&roots, &central_state),
+        host_path_apply_params(&roots, &central_state, &central_journal),
         "migration.schema.json#/$defs/MigrationApplyErrorResponse",
         "conflict",
     );
-    assert_host_path_apply_rejection(&response, &central_state);
+    assert_host_path_apply_rejection(&response, &central_state, &central_journal);
 }
 
-fn host_path_apply_params(roots: &TempRoots, central_state: &Path) -> Value {
+fn host_path_apply_params(
+    roots: &TempRoots,
+    central_state: &Path,
+    central_journal: &Path,
+) -> Value {
     json!({
         "confirmed": true,
         "confirmation": {
@@ -380,6 +425,12 @@ fn host_path_apply_params(roots: &TempRoots, central_state: &Path) -> Value {
             {
                 "kind": "write_file",
                 "provider_owned": true,
+                "path": central_journal.display().to_string(),
+                "content": { "encoding": "utf8", "data": "SHOULD_NOT_OVERWRITE_HOST_JOURNAL" }
+            },
+            {
+                "kind": "write_file",
+                "provider_owned": true,
                 "path": central_state.display().to_string(),
                 "content": { "encoding": "utf8", "data": "SHOULD_NOT_OVERWRITE_HOST_STATE" }
             }
@@ -387,12 +438,17 @@ fn host_path_apply_params(roots: &TempRoots, central_state: &Path) -> Value {
     })
 }
 
-fn assert_host_path_apply_rejection(response: &Value, central_state: &Path) {
+fn assert_host_path_apply_rejection(
+    response: &Value,
+    central_state: &Path,
+    central_journal: &Path,
+) {
     assert_eq!(
         response["error"]["code"],
         "migration_action_outside_provider_root"
     );
     assert_file(central_state, "HOST_CENTRAL_STATE_SENTINEL");
+    assert_file(central_journal, "HOST_CENTRAL_JOURNAL_SENTINEL");
 }
 
 #[cfg(unix)]
