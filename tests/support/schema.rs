@@ -1,4 +1,4 @@
-// declared_role: orchestration, mapper, parser, validator, formatter, accessor, filter
+// declared_role: orchestration, mapper, parser, validator, formatter, accessor, filter, predicate
 
 use jsonschema::{Draft, JSONSchema};
 use serde_json::{json, Map, Value};

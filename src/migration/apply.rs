@@ -1,4 +1,4 @@
-// declared_role: accessor, formatter, mapper, orchestration, parser, predicate, validator
+// declared_role: accessor, filter, formatter, mapper, orchestration, parser, predicate, validator
 // adapter_declarations:
 //   - component: src/migration/apply.rs
 //     role: adapter
@@ -59,12 +59,33 @@ pub fn handle(request: &RequestEnvelope) -> Result<Value, ProviderFailure> {
 }
 
 fn apply_request(request: &RequestEnvelope) -> Result<ApplyRequest<'_>, ProviderFailure> {
-    let params = request.params.as_object().ok_or_else(invalid_params)?;
-    Ok(ApplyRequest {
-        globally_confirmed: globally_confirmed(params),
-        actions: actions(params)?,
-        provider_roots: provider_roots(request)?,
-    })
+    let params = apply_params(request)?;
+    let globally_confirmed = globally_confirmed(params);
+    let actions = actions(params)?;
+    let provider_roots = provider_roots(request)?;
+    Ok(apply_request_value(
+        globally_confirmed,
+        actions,
+        provider_roots,
+    ))
+}
+
+fn apply_params(
+    request: &RequestEnvelope,
+) -> Result<&serde_json::Map<String, Value>, ProviderFailure> {
+    request.params.as_object().ok_or_else(invalid_params)
+}
+
+fn apply_request_value(
+    globally_confirmed: bool,
+    actions: &[Value],
+    provider_roots: ProviderRoots,
+) -> ApplyRequest<'_> {
+    ApplyRequest {
+        globally_confirmed,
+        actions,
+        provider_roots,
+    }
 }
 
 fn apply_provider_writes(
@@ -174,10 +195,12 @@ fn confirmed_provider_write(
 ) -> Result<MigrationAction, ProviderFailure> {
     let path = action_path(action)?;
     let confined_path = confined_provider_path(&path, provider_roots)?;
-    Ok(MigrationAction {
-        path: confined_path,
-        bytes: action_content(action)?,
-    })
+    let bytes = action_content(action)?;
+    Ok(migration_action(confined_path, bytes))
+}
+
+fn migration_action(path: PathBuf, bytes: Vec<u8>) -> MigrationAction {
+    MigrationAction { path, bytes }
 }
 
 fn action_path(action: &Value) -> Result<PathBuf, ProviderFailure> {
@@ -191,14 +214,28 @@ fn action_path(action: &Value) -> Result<PathBuf, ProviderFailure> {
 
 fn provider_roots(request: &RequestEnvelope) -> Result<ProviderRoots, ProviderFailure> {
     let base = host_data_root(&request.host)?;
-    let mut roots = vec![crate::fs::paths::normalized_absolute(
-        &base.join("claude"),
-        &base,
-    )];
-    if let Some(root) = claude_home_root(&request.host) {
-        roots.push(crate::fs::paths::normalized_absolute(&root, &base));
+    let home_root = claude_home_root(&request.host);
+    Ok(provider_roots_value(&base, home_root))
+}
+
+fn provider_roots_value(base: &Path, home_root: Option<PathBuf>) -> ProviderRoots {
+    ProviderRoots {
+        roots: provider_root_paths(base, home_root),
     }
-    Ok(ProviderRoots { roots })
+}
+
+fn provider_root_paths(base: &Path, home_root: Option<PathBuf>) -> Vec<PathBuf> {
+    let mut roots = vec![normalized_provider_data_root(base)];
+    roots.extend(normalized_home_root(home_root.as_deref(), base));
+    roots
+}
+
+fn normalized_provider_data_root(base: &Path) -> PathBuf {
+    crate::fs::paths::normalized_absolute(&base.join("claude"), base)
+}
+
+fn normalized_home_root(root: Option<&Path>, base: &Path) -> Option<PathBuf> {
+    root.map(|root| crate::fs::paths::normalized_absolute(root, base))
 }
 
 fn host_data_root(host: &Value) -> Result<PathBuf, ProviderFailure> {
@@ -206,22 +243,35 @@ fn host_data_root(host: &Value) -> Result<PathBuf, ProviderFailure> {
 }
 
 fn claude_home_root(host: &Value) -> Option<PathBuf> {
+    accepted_home_value(home_value(host)).map(claude_home_path)
+}
+
+fn home_value(host: &Value) -> Option<&str> {
     host.get("env")
         .and_then(|env| env.get("HOME"))
         .and_then(Value::as_str)
-        .filter(|home| !home.is_empty())
-        .map(|home| Path::new(home).join(".claude"))
+}
+
+fn accepted_home_value(home: Option<&str>) -> Option<&str> {
+    home.filter(|home| !home.is_empty())
+}
+
+fn claude_home_path(home: &str) -> PathBuf {
+    Path::new(home).join(".claude")
 }
 
 fn confined_provider_path(
     path: &Path,
     provider_roots: &ProviderRoots,
 ) -> Result<PathBuf, ProviderFailure> {
+    selected_confined_provider_path(path, &provider_roots.roots)
+        .ok_or_else(|| outside_provider_root(path, &provider_roots.roots))
+}
+
+fn selected_confined_provider_path(path: &Path, provider_roots: &[PathBuf]) -> Option<PathBuf> {
     provider_roots
-        .roots
         .iter()
         .find_map(|provider_root| crate::fs::paths::confined_child_path(provider_root, path).ok())
-        .ok_or_else(|| outside_provider_root(path, &provider_roots.roots))
 }
 
 fn action_content(action: &Value) -> Result<Vec<u8>, ProviderFailure> {
@@ -241,10 +291,13 @@ enum ActionContentEncoding {
 
 fn action_content_fields(action: &Value) -> Result<ActionContentFields<'_>, ProviderFailure> {
     let content = action_content_object(action)?;
-    Ok(ActionContentFields {
-        encoding: action_content_encoding(content)?,
-        data: action_content_data(content)?,
-    })
+    let encoding = action_content_encoding(content)?;
+    let data = action_content_data(content)?;
+    Ok(action_content_fields_value(encoding, data))
+}
+
+fn action_content_fields_value<'a>(encoding: &'a str, data: &'a str) -> ActionContentFields<'a> {
+    ActionContentFields { encoding, data }
 }
 
 fn action_content_object(

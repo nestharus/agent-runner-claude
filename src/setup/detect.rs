@@ -1,4 +1,4 @@
-// declared_role: accessor, formatter, mapper, orchestration, parser, predicate, validator
+// declared_role: accessor, filter, formatter, mapper, orchestration, parser, predicate, validator
 
 use std::fs;
 use std::path::{Path, PathBuf};

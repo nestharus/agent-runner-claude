@@ -25,38 +25,75 @@ fn provider_root(
     params: &serde_json::Map<String, Value>,
 ) -> Result<String, ProviderFailure> {
     let roots = provider_roots(request)?;
-    if let Some(root) = explicit_provider_root(params) {
-        return confined_provider_root(&root, &roots);
+    let requested = selected_provider_root(request, params)?;
+    confined_provider_root(&requested, &roots)
+}
+
+fn selected_provider_root(
+    request: &RequestEnvelope,
+    params: &serde_json::Map<String, Value>,
+) -> Result<PathBuf, ProviderFailure> {
+    match explicit_provider_root(params) {
+        Some(root) => Ok(PathBuf::from(root)),
+        None => default_provider_root(request),
     }
-    confined_provider_root(&crate::fs::paths::provider_data_dir(&request.host)?, &roots)
+}
+
+fn default_provider_root(request: &RequestEnvelope) -> Result<PathBuf, ProviderFailure> {
+    crate::fs::paths::provider_data_dir(&request.host)
 }
 
 fn explicit_provider_root(params: &serde_json::Map<String, Value>) -> Option<String> {
-    params
-        .get("provider_root")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
+    accepted_provider_root(provider_root_value(params)).map(owned_provider_root)
+}
+
+fn provider_root_value(params: &serde_json::Map<String, Value>) -> Option<&str> {
+    params.get("provider_root").and_then(Value::as_str)
+}
+
+fn accepted_provider_root(root: Option<&str>) -> Option<&str> {
+    root.filter(|value| !value.is_empty())
+}
+
+fn owned_provider_root(root: &str) -> String {
+    root.to_string()
 }
 
 fn provider_roots(request: &RequestEnvelope) -> Result<Vec<PathBuf>, ProviderFailure> {
     let base = crate::fs::paths::host_data_root(&request.host)?;
-    let mut roots = vec![crate::fs::paths::normalized_absolute(
-        &base.join("claude"),
-        &base,
-    )];
-    if let Some(root) = claude_home_root(&request.host) {
-        roots.push(crate::fs::paths::normalized_absolute(&root, &base));
-    }
-    Ok(roots)
+    Ok(provider_root_paths(&base, claude_home_root(&request.host)))
+}
+
+fn provider_root_paths(base: &Path, home_root: Option<PathBuf>) -> Vec<PathBuf> {
+    let mut roots = vec![normalized_provider_data_root(base)];
+    roots.extend(normalized_home_root(home_root.as_deref(), base));
+    roots
+}
+
+fn normalized_provider_data_root(base: &Path) -> PathBuf {
+    crate::fs::paths::normalized_absolute(&base.join("claude"), base)
+}
+
+fn normalized_home_root(root: Option<&Path>, base: &Path) -> Option<PathBuf> {
+    root.map(|root| crate::fs::paths::normalized_absolute(root, base))
 }
 
 fn claude_home_root(host: &Value) -> Option<PathBuf> {
+    accepted_home_value(home_value(host)).map(claude_home_path)
+}
+
+fn home_value(host: &Value) -> Option<&str> {
     host.get("env")
         .and_then(|env| env.get("HOME"))
         .and_then(Value::as_str)
-        .filter(|home| !home.is_empty())
-        .map(|home| Path::new(home).join(".claude"))
+}
+
+fn accepted_home_value(home: Option<&str>) -> Option<&str> {
+    home.filter(|home| !home.is_empty())
+}
+
+fn claude_home_path(home: &str) -> PathBuf {
+    Path::new(home).join(".claude")
 }
 
 fn confined_provider_root(
@@ -72,12 +109,17 @@ fn confined_provider_root_path(
     requested_root: &Path,
     provider_roots: &[PathBuf],
 ) -> Result<PathBuf, ProviderFailure> {
-    provider_roots
-        .iter()
-        .find_map(|provider_root| {
-            crate::fs::paths::confined_path_or_root(provider_root, requested_root).ok()
-        })
+    selected_confined_provider_root(requested_root, provider_roots)
         .ok_or_else(|| outside_provider_root(requested_root, provider_roots))
+}
+
+fn selected_confined_provider_root(
+    requested_root: &Path,
+    provider_roots: &[PathBuf],
+) -> Option<PathBuf> {
+    provider_roots.iter().find_map(|provider_root| {
+        crate::fs::paths::confined_path_or_root(provider_root, requested_root).ok()
+    })
 }
 
 fn display_path(path: &Path) -> String {

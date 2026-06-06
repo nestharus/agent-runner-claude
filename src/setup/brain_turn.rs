@@ -1,4 +1,4 @@
-// declared_role: accessor, formatter, mapper, orchestration, parser, validator
+// declared_role: accessor, filter, formatter, mapper, orchestration, parser, validator
 // adapter_declarations:
 //   - component: src/setup/brain_turn.rs
 //     role: adapter

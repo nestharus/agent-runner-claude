@@ -1,4 +1,4 @@
-// declared_role: accessor, formatter, mapper, orchestration, parser, validator
+// declared_role: accessor, filter, formatter, mapper, orchestration, parser, validator
 // adapter_declarations:
 //   - component: src/rotation/materialize.rs
 //     role: adapter
@@ -34,13 +34,37 @@ pub fn handle(request: &RequestEnvelope) -> Result<Value, ProviderFailure> {
 fn materialization_input(
     request: &RequestEnvelope,
 ) -> Result<MaterializationInput, ProviderFailure> {
-    let params = request.params.as_object().ok_or_else(invalid_params)?;
-    Ok(MaterializationInput {
-        bytes: canonical_transcript_bytes(&request.params)?,
-        target_session_id: filename_param(params, "target_session_id", "target-session")?,
-        chain_id: filename_param(params, "chain_id", "rotation-chain")?,
-        root: artifact_root(&request.host, &request.params)?,
-    })
+    let params = materialization_params(request)?;
+    let bytes = canonical_transcript_bytes(&request.params)?;
+    let target_session_id = filename_param(params, "target_session_id", "target-session")?;
+    let chain_id = filename_param(params, "chain_id", "rotation-chain")?;
+    let root = artifact_root(&request.host, &request.params)?;
+    Ok(materialization_input_value(
+        bytes,
+        target_session_id,
+        chain_id,
+        root,
+    ))
+}
+
+fn materialization_params(
+    request: &RequestEnvelope,
+) -> Result<&serde_json::Map<String, Value>, ProviderFailure> {
+    request.params.as_object().ok_or_else(invalid_params)
+}
+
+fn materialization_input_value(
+    bytes: Vec<u8>,
+    target_session_id: String,
+    chain_id: String,
+    root: PathBuf,
+) -> MaterializationInput {
+    MaterializationInput {
+        bytes,
+        target_session_id,
+        chain_id,
+        root,
+    }
 }
 
 fn filename_param(
@@ -144,16 +168,34 @@ fn canonical_transcript_payload(
 fn canonical_transcript_fields(
     payload: &serde_json::Map<String, Value>,
 ) -> Result<CanonicalTranscriptFields<'_>, ProviderFailure> {
-    Ok(CanonicalTranscriptFields {
-        kind: payload
-            .get("kind")
-            .and_then(Value::as_str)
-            .ok_or_else(invalid_params)?,
-        data_base64: payload
-            .get("data_base64")
-            .and_then(Value::as_str)
-            .ok_or_else(invalid_params)?,
-    })
+    let kind = canonical_transcript_kind(payload)?;
+    let data_base64 = canonical_transcript_data_base64(payload)?;
+    Ok(canonical_transcript_fields_value(kind, data_base64))
+}
+
+fn canonical_transcript_kind(
+    payload: &serde_json::Map<String, Value>,
+) -> Result<&str, ProviderFailure> {
+    payload
+        .get("kind")
+        .and_then(Value::as_str)
+        .ok_or_else(invalid_params)
+}
+
+fn canonical_transcript_data_base64(
+    payload: &serde_json::Map<String, Value>,
+) -> Result<&str, ProviderFailure> {
+    payload
+        .get("data_base64")
+        .and_then(Value::as_str)
+        .ok_or_else(invalid_params)
+}
+
+fn canonical_transcript_fields_value<'a>(
+    kind: &'a str,
+    data_base64: &'a str,
+) -> CanonicalTranscriptFields<'a> {
+    CanonicalTranscriptFields { kind, data_base64 }
 }
 
 fn require_canonical_transcript_kind(kind: &str) -> Result<(), ProviderFailure> {
@@ -196,12 +238,17 @@ fn confined_artifact_root(
     requested_root: &Path,
     provider_roots: &[PathBuf],
 ) -> Result<PathBuf, ProviderFailure> {
-    provider_roots
-        .iter()
-        .find_map(|provider_root| {
-            crate::fs::paths::confined_path_or_root(provider_root, requested_root).ok()
-        })
+    selected_confined_artifact_root(requested_root, provider_roots)
         .ok_or_else(|| outside_provider_root(requested_root, provider_roots))
+}
+
+fn selected_confined_artifact_root(
+    requested_root: &Path,
+    provider_roots: &[PathBuf],
+) -> Option<PathBuf> {
+    provider_roots.iter().find_map(|provider_root| {
+        crate::fs::paths::confined_path_or_root(provider_root, requested_root).ok()
+    })
 }
 
 fn provider_artifact_roots(data_root: &Path) -> Vec<PathBuf> {
@@ -212,18 +259,24 @@ fn provider_artifact_roots(data_root: &Path) -> Vec<PathBuf> {
 }
 
 fn host_data_root(host: &Value) -> Result<PathBuf, ProviderFailure> {
-    host_data_root_value(host)
-        .filter(non_empty_string)
-        .map(PathBuf::from)
-        .ok_or_else(missing_host_data_root)
+    let root = required_host_data_root(accepted_host_data_root(host_data_root_value(host)))?;
+    Ok(path_buf(root))
 }
 
 fn host_data_root_value(host: &Value) -> Option<&str> {
     host.get("data_root").and_then(Value::as_str)
 }
 
-fn non_empty_string(value: &&str) -> bool {
-    !value.is_empty()
+fn accepted_host_data_root(root: Option<&str>) -> Option<&str> {
+    root.filter(|root| !root.is_empty())
+}
+
+fn required_host_data_root(root: Option<&str>) -> Result<&str, ProviderFailure> {
+    root.ok_or_else(missing_host_data_root)
+}
+
+fn path_buf(path: &str) -> PathBuf {
+    PathBuf::from(path)
 }
 
 fn missing_host_data_root() -> ProviderFailure {
@@ -234,11 +287,15 @@ fn missing_host_data_root() -> ProviderFailure {
 }
 
 fn requested_artifact_root(params: &Value) -> Option<PathBuf> {
-    params
-        .get("provider_artifact_root")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
+    accepted_requested_artifact_root(requested_artifact_root_value(params)).map(path_buf)
+}
+
+fn requested_artifact_root_value(params: &Value) -> Option<&str> {
+    params.get("provider_artifact_root").and_then(Value::as_str)
+}
+
+fn accepted_requested_artifact_root(root: Option<&str>) -> Option<&str> {
+    root.filter(|root| !root.is_empty())
 }
 
 fn outside_provider_root(path: &Path, provider_roots: &[PathBuf]) -> ProviderFailure {

@@ -1,4 +1,12 @@
 // declared_role: orchestration, mapper, parser, validator, formatter
+// adapter_declarations:
+//   - component: tests/support/invoke.rs
+//     role: adapter
+//     Translates:
+//       - provider binary process contract (argv/stdin/stdout/stderr/exit)
+//       - contract/v1/common.schema.json#/$defs/SuccessResponseEnvelope
+//       - contract/v1/common.schema.json#/$defs/ErrorResponseEnvelope
+//       - contract/v1/launch.schema.json JSONL event stream
 
 use serde_json::Value;
 use std::io::Write;

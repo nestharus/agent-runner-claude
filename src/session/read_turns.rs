@@ -1,4 +1,12 @@
 // declared_role: orchestration, filter, validator, predicate, mapper, accessor, formatter, parser
+// adapter_declarations:
+//   - component: src/session/read_turns.rs
+//     role: adapter
+//     Translates:
+//       - contract/v1/session.schema.json#/$defs/SessionReadTurnsRequest
+//       - contract/v1/session.schema.json#/$defs/SessionReadTurnsResult
+//       - src/session/storage.rs transcript locate/read seam
+//       - src/session/native_claude.rs native transcript parse/turn projection seam
 
 use serde_json::{json, Value};
 

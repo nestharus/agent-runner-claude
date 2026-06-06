@@ -1,4 +1,4 @@
-// declared_role: accessor, formatter, mapper
+// declared_role: accessor, filter, formatter, mapper, orchestration, validator
 
 use serde_json::{json, Value};
 
@@ -43,11 +43,11 @@ fn artifact_summary(artifact: &Value) -> ArtifactSummary {
 }
 
 fn artifact_string(artifact: &Value, key: &str, default: &str) -> String {
-    artifact
-        .get(key)
-        .and_then(Value::as_str)
-        .unwrap_or(default)
-        .to_string()
+    owned_string(artifact_string_value(artifact, key, default))
+}
+
+fn artifact_string_value<'a>(artifact: &'a Value, key: &str, default: &'a str) -> &'a str {
+    artifact.get(key).and_then(Value::as_str).unwrap_or(default)
 }
 
 fn format_materialized_plan(facts: PlanFacts, artifacts: Vec<ArtifactSummary>) -> Value {
@@ -77,7 +77,15 @@ fn format_artifact_summary(summary: ArtifactSummary) -> Value {
 }
 
 fn transition_reason(params: &Value) -> &'static str {
-    match params.get("transition_reason").and_then(Value::as_str) {
+    accepted_transition_reason(transition_reason_value(params))
+}
+
+fn transition_reason_value(params: &Value) -> Option<&str> {
+    params.get("transition_reason").and_then(Value::as_str)
+}
+
+fn accepted_transition_reason(reason: Option<&str>) -> &'static str {
+    match reason {
         Some("manual") => "manual",
         Some("quota_threshold") => "quota_threshold",
         Some("exhausted") => "exhausted",
@@ -86,10 +94,17 @@ fn transition_reason(params: &Value) -> &'static str {
 }
 
 fn string(params: &Value, key: &str, default: &str) -> String {
-    params
-        .get(key)
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(default)
-        .to_string()
+    owned_string(accepted_string_value(string_value(params, key)).unwrap_or(default))
+}
+
+fn string_value<'a>(params: &'a Value, key: &str) -> Option<&'a str> {
+    params.get(key).and_then(Value::as_str)
+}
+
+fn accepted_string_value(value: Option<&str>) -> Option<&str> {
+    value.filter(|value| !value.is_empty())
+}
+
+fn owned_string(value: &str) -> String {
+    value.to_string()
 }

@@ -1,4 +1,4 @@
-// declared_role: orchestration, accessor, formatter
+// declared_role: orchestration, accessor, formatter, predicate
 // facade_declarations:
 //   - component: src/lib.rs
 //     role: common-interface-facade

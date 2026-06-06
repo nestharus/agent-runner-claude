@@ -1,4 +1,13 @@
 // declared_role: accessor, formatter, mapper, orchestration
+// adapter_declarations:
+//   - component: tests/support/fixtures.rs
+//     role: adapter
+//     Translates:
+//       - contract/v1/common.schema.json#/$defs/RequestEnvelope
+//       - contract/v1/common.schema.json#/$defs/HostContext
+//       - provider contract id fixture constant
+//       - isolated test temp-root fixture surface
+//       - test path display string surface
 
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};

@@ -1,4 +1,13 @@
 // declared_role: orchestration, filter, validator, predicate, mapper, accessor, formatter, parser
+// adapter_declarations:
+//   - component: src/session/export.rs
+//     role: adapter
+//     Translates:
+//       - contract/v1/session.schema.json#/$defs/SessionExportRequest
+//       - contract/v1/session.schema.json#/$defs/SessionExportResult
+//       - src/session/storage.rs transcript locate/read seam
+//       - src/session/native_claude.rs native-to-canonical transcript projection seam
+//       - src/session/canonical.rs canonical transcript serialization/count seam
 
 use serde_json::{json, Value};
 

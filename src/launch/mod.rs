@@ -64,10 +64,15 @@ fn launch(request: &RequestEnvelope) -> Result<Value, ProviderFailure> {
 fn stream_pre_spawn_exit(request_id: &str, reason: &str) -> ! {
     let stdout = io::stdout();
     let mut events = events::EventWriter::new(stdout.lock(), request_id);
-    let status = spawn_error_status(&io::Error::new(io::ErrorKind::InvalidInput, reason));
+    let status = pre_spawn_rejection_status(reason);
     let signal = terminal_signal(&status);
     let _ = events.exit(status, signal);
     std::process::exit(0);
+}
+
+fn pre_spawn_rejection_status(reason: &str) -> Value {
+    let error = io::Error::new(io::ErrorKind::InvalidInput, reason);
+    spawn_error_status(&error)
 }
 
 fn validate_required_params(params: &Value) -> Result<(), String> {
