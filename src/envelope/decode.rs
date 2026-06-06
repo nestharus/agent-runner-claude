@@ -181,11 +181,11 @@ fn validate_contract(contract: &str, request_id: &str) -> Result<(), ProviderFai
     if contract == CONTRACT {
         Ok(())
     } else {
-        Err(ProviderFailure::invalid_request_with_request_id(
-            request_id.to_string(),
+        Err(ProviderFailure::unsupported(
             "unsupported_contract",
             format!("unsupported provider contract: {contract}"),
-        ))
+        )
+        .with_request_id(request_id.to_string()))
     }
 }
 

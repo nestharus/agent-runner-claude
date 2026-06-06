@@ -42,14 +42,14 @@ fn invalid_utf8_stdin_returns_schema_valid_invalid_request_error() {
 }
 
 #[test]
-fn wrong_contract_returns_schema_valid_invalid_request_error() {
+fn wrong_contract_returns_schema_valid_unsupported_error() {
     let roots = temp_roots("wrong-contract");
     let request = envelope("oulipoly.provider/v0", host_context(&roots), json!({}));
     let output = invoke("describe", &request);
-    assert_eq!(output.code, Some(2));
+    assert_eq!(output.code, Some(3));
     assert!(output.stderr.is_empty());
     let response = parse_one_stdout_json(&output);
-    assert_error_response(&response, "invalid_request");
+    assert_error_response(&response, "unsupported");
 }
 
 #[test]

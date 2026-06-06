@@ -9,6 +9,7 @@
 
 mod support;
 
+use agent_runner_claude::encoding::sha256_hex;
 use serde_json::{json, Value};
 use std::fs;
 #[cfg(unix)]
@@ -247,6 +248,7 @@ fn migration_apply_only_performs_confirmed_provider_owned_actions_and_leaves_hos
     fs::create_dir_all(&provider_root).unwrap();
     let central_state = roots.data_root.join("central-state.sqlite");
     write(&central_state, "CENTRAL_STATE_SENTINEL_BEFORE_MIGRATION");
+    let confirmed_provider_file = provider_root.join("settings.v1.json");
     let unconfirmed_provider_file = provider_root.join("unconfirmed.json");
     write(&unconfirmed_provider_file, "UNCONFIRMED_PROVIDER_SENTINEL");
 
@@ -261,6 +263,11 @@ fn migration_apply_only_performs_confirmed_provider_owned_actions_and_leaves_hos
         ),
     );
     assert_migration_apply_response(&response);
+    assert_migration_apply_wrote_provider_file(
+        &response,
+        &confirmed_provider_file,
+        "{\"provider\":\"claude\"}",
+    );
     assert_migration_apply_sentinels(&central_state, &unconfirmed_provider_file);
 }
 
@@ -329,6 +336,20 @@ fn assert_migration_apply_response(response: &Value) {
 fn assert_migration_apply_sentinels(central_state: &Path, unconfirmed_provider_file: &Path) {
     assert_file(central_state, "CENTRAL_STATE_SENTINEL_BEFORE_MIGRATION");
     assert_file(unconfirmed_provider_file, "UNCONFIRMED_PROVIDER_SENTINEL");
+}
+
+fn assert_migration_apply_wrote_provider_file(response: &Value, path: &Path, expected: &str) {
+    assert_file(path, expected);
+
+    let actual = fs::read(path).expect("read applied provider file");
+    let expected_path = path.display().to_string();
+    let artifact = response["result"]["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|artifact| artifact["path"].as_str() == Some(expected_path.as_str()))
+        .unwrap_or_else(|| panic!("missing artifact metadata for {expected_path}"));
+    assert_eq!(artifact["sha256"], sha256_hex(&actual));
 }
 
 #[test]

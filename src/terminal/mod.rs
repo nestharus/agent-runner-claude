@@ -1,4 +1,11 @@
 // declared_role: orchestration, validator, parser, mapper, formatter
+// intrinsic_surface_declarations:
+//   - component: src/terminal/mod.rs
+//     role: intrinsic-surface
+//     Domain: terminal_capability_module_index
+//     Owns:
+//       - terminal capability submodule declaration set
+//       - terminal.classify request orchestration and response surface
 
 pub mod classifier;
 pub mod evidence;

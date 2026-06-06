@@ -9,12 +9,15 @@
 
 mod support;
 
+use agent_runner_claude::encoding::sha256_hex;
 use serde_json::{json, Value};
 use std::fs;
 use std::path::Path;
 use support::fixtures::{envelope, host_context, temp_roots, TempRoots, CONTRACT};
 use support::invoke::{invoke, parse_one_stdout_json};
 use support::schema::assert_valid;
+
+const MATERIALIZE_CANONICAL_BYTES: &[u8] = br#"{"turn":1}"#;
 
 fn call(roots: &TempRoots, subcommand: &str, params: Value) -> Value {
     let output = invoke(subcommand, &contract_request(roots, params));
@@ -196,6 +199,12 @@ fn rotation_materialize_returns_provider_artifacts_plan_and_does_not_apply_host_
         materialize_params(&roots, &host_db, &host_journal, target_session_id),
     );
     assert_materialize_response(&response, &host_db, &host_journal, target_session_id);
+    assert_materialized_artifact_files(
+        &response,
+        &host_db,
+        &host_journal,
+        MATERIALIZE_CANONICAL_BYTES,
+    );
     assert_materialize_sentinels(&host_db, &host_journal);
 }
 
@@ -270,6 +279,24 @@ fn assert_materialize_response(
 fn assert_materialize_sentinels(host_db: &Path, host_journal: &Path) {
     assert_sentinel(host_db, "CENTRAL_DB_BEFORE_ROTATION");
     assert_sentinel(host_journal, "CENTRAL_JOURNAL_BEFORE_ROTATION");
+}
+
+fn assert_materialized_artifact_files(
+    response: &Value,
+    host_db: &Path,
+    host_journal: &Path,
+    expected_bytes: &[u8],
+) {
+    for artifact in response["result"]["artifacts"].as_array().unwrap() {
+        let path = artifact["path"].as_str().expect("artifact path");
+        assert_ne!(path, host_db.display().to_string());
+        assert_ne!(path, host_journal.display().to_string());
+
+        let bytes = fs::read(path)
+            .unwrap_or_else(|error| panic!("read materialized rotation artifact {path}: {error}"));
+        assert_eq!(bytes, expected_bytes, "artifact bytes changed at {path}");
+        assert_eq!(artifact["sha256"], sha256_hex(&bytes));
+    }
 }
 
 #[test]
