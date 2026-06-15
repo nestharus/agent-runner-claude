@@ -2,10 +2,15 @@
 // intrinsic_surface_declarations:
 //   - component: src/launch/mod.rs
 //     role: intrinsic-surface
-//     Domain: launch_capability_module_index
+//     Domain: provider child launch and contract-event streaming
 //     Owns:
 //       - launch capability submodule declaration set
-//       - launch request dispatch and pre-spawn stream surface
+//       - launch request envelope decode plus params/env/argv/stdin extraction
+//       - provider child process spawn, lifecycle, and descendant termination
+//       - child stdout/stderr drain streaming over mpsc channels and worker threads
+//       - launch contract event output (started/heartbeat/data/marker/exit) to process stdout
+//       - deadline, heartbeat, and drain-grace timing
+//       - terminal status to terminal-signal mapping plus spawn and pre-spawn error formatting
 
 pub mod child;
 pub mod drain;
@@ -13,6 +18,7 @@ pub mod events;
 pub mod params;
 pub mod session_marker;
 pub mod stdin;
+pub mod submitted_user_turn;
 
 use serde_json::json;
 use serde_json::Value;
@@ -59,13 +65,22 @@ fn launch(request: &RequestEnvelope) -> Result<Value, ProviderFailure> {
         Ok(bytes) => bytes,
         Err(failure) => stream_pre_spawn_exit(&request.request_id, &failure.message),
     };
+    let resume_confirmation = submitted_user_turn::resume_confirmation(params, &argv, &stdin_bytes);
     let env = match launch_env(request, params) {
         Ok(env) => env,
         Err(failure) => stream_pre_spawn_exit(&request.request_id, &failure.message),
     };
     let deadline = deadline_unix_ms(request);
 
-    stream_launch_and_exit(&request.request_id, &argv, cwd, &env, stdin_bytes, deadline);
+    stream_launch_and_exit(
+        &request.request_id,
+        &argv,
+        cwd,
+        &env,
+        stdin_bytes,
+        deadline,
+        resume_confirmation,
+    );
 }
 
 fn stream_pre_spawn_exit(request_id: &str, reason: &str) -> ! {
@@ -167,12 +182,32 @@ fn stream_launch_and_exit(
     env: &BTreeMap<String, String>,
     stdin_bytes: Vec<u8>,
     deadline: Option<u64>,
+    resume_confirmation: Option<submitted_user_turn::ResumeConfirmation>,
 ) -> ! {
     let stdout = io::stdout();
     let mut events = events::EventWriter::new(stdout.lock(), request_id);
     let status = launch_status(&mut events, argv, cwd, env, stdin_bytes, deadline);
+    emit_submitted_user_turn_marker(&mut events, &status, resume_confirmation.as_ref());
     emit_terminal_exit(&mut events, status);
     std::process::exit(0);
+}
+
+// declared_role: orchestration
+fn emit_submitted_user_turn_marker<W: Write>(
+    events: &mut events::EventWriter<W>,
+    status: &Value,
+    confirmation: Option<&submitted_user_turn::ResumeConfirmation>,
+) {
+    if !is_clean_exit(status) {
+        return;
+    }
+    let Some(confirmation) = confirmation else {
+        return;
+    };
+    let _ = events.marker(
+        submitted_user_turn::marker_name(),
+        submitted_user_turn::marker_value(confirmation),
+    );
 }
 
 fn launch_status<W: Write>(

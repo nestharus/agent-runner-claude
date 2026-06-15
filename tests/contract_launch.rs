@@ -9,7 +9,7 @@
 
 mod support;
 
-use agent_runner_claude::encoding::encode_base64;
+use agent_runner_claude::encoding::{encode_base64, sha256_hex};
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{Read, Write};
@@ -391,6 +391,127 @@ fn assert_descendant_stdio_output(output: support::invoke::Invocation) {
         json!({ "kind": "exited", "code": 0 })
     );
     assert_eq!(final_event["terminal_signal"]["kind"], "clean_exit");
+}
+
+#[test]
+fn launch_clean_resume_emits_submitted_user_turn_marker() {
+    let roots = temp_roots("launch-submitted-user-turn-clean-resume");
+    let script = stdin_sink_fixture(&roots, 0);
+    let prompt =
+        "Notifications delivered:\n[OULIPOLY-DELIVERY 5169694d-de0f-40d1-890c-6e28e55bab27]\n";
+
+    let request = resume_stdin_request(&roots, &script, prompt, Some("claude-session-123"));
+    let output = invoke("launch", &request);
+    assert_clean_resume_submitted_user_turn_marker(output, prompt);
+}
+
+#[test]
+fn launch_non_resume_emits_no_submitted_user_turn_marker() {
+    let roots = temp_roots("launch-submitted-user-turn-non-resume");
+    let script = stdin_sink_fixture(&roots, 0);
+    let prompt = "Notifications delivered:\n[OULIPOLY-DELIVERY nonce-non-resume]\n";
+
+    let request = resume_stdin_request(&roots, &script, prompt, None);
+    let output = invoke("launch", &request);
+    assert_no_submitted_user_turn_marker(output);
+}
+
+#[test]
+fn launch_non_clean_resume_emits_no_submitted_user_turn_marker() {
+    let roots = temp_roots("launch-submitted-user-turn-non-clean");
+    let script = stdin_sink_fixture(&roots, 7);
+    let prompt = "Notifications delivered:\n[OULIPOLY-DELIVERY nonce-non-clean]\n";
+
+    let request = resume_stdin_request(&roots, &script, prompt, Some("claude-session-123"));
+    let output = invoke("launch", &request);
+    assert_no_submitted_user_turn_marker(output);
+}
+
+// declared_role: orchestration
+fn stdin_sink_fixture(roots: &support::fixtures::TempRoots, exit_code: i32) -> PathBuf {
+    let script = roots.root.join(format!("stdin-sink-{exit_code}.sh"));
+    write_executable(&script, &stdin_sink_script(exit_code));
+    script
+}
+
+// declared_role: formatter
+fn stdin_sink_script(exit_code: i32) -> String {
+    format!("#!/bin/sh\n/bin/cat >/dev/null\nexit {exit_code}\n")
+}
+
+// declared_role: formatter
+fn resume_stdin_request(
+    roots: &support::fixtures::TempRoots,
+    script: &std::path::Path,
+    prompt: &str,
+    session_id: Option<&str>,
+) -> Value {
+    let mut extra = json!({ "stdin": { "encoding": "utf8", "data": prompt } });
+    if let Some(session_id) = session_id {
+        extra["session"] = json!({ "known_provider_session_id": session_id });
+    }
+    launch_request(roots, vec![path_string(script)], extra)
+}
+
+// declared_role: validator
+fn assert_clean_resume_submitted_user_turn_marker(
+    output: support::invoke::Invocation,
+    prompt: &str,
+) {
+    let events = assert_valid_launch_invocation(output);
+    let markers = submitted_user_turn_markers(&events);
+    assert_eq!(
+        markers.len(),
+        1,
+        "expected exactly one submitted marker: {events:?}"
+    );
+    let marker = markers[0];
+    assert_eq!(marker["value"]["provider_session_id"], "claude-session-123");
+    assert_eq!(
+        marker["value"]["prompt_sha256"],
+        sha256_hex(prompt.as_bytes())
+    );
+    assert_eq!(marker["value"]["source"], "claudecode.launch");
+    assert_eq!(
+        marker["value"]["delivery_nonce"],
+        "5169694d-de0f-40d1-890c-6e28e55bab27"
+    );
+    assert!(
+        marker["value"].get("message_id").is_none(),
+        "claude submitted marker must omit message_id: {marker}"
+    );
+    assert_eq!(events.last().unwrap()["kind"], "exit");
+}
+
+// declared_role: validator
+fn assert_no_submitted_user_turn_marker(output: support::invoke::Invocation) {
+    let events = assert_valid_launch_invocation(output);
+    let markers = submitted_user_turn_markers(&events);
+    assert!(
+        markers.is_empty(),
+        "submitted marker must not be emitted: {events:?}"
+    );
+}
+
+// declared_role: validator
+fn assert_valid_launch_invocation(output: support::invoke::Invocation) -> Vec<Value> {
+    assert_eq!(output.code, Some(0));
+    assert!(output.stderr.is_empty());
+    let events = collect_launch_jsonl_lines(&output);
+    for event in &events {
+        assert_launch_event_valid(event);
+    }
+    assert_seq_starts_at_one_and_monotonic(&events);
+    events
+}
+
+// declared_role: accessor
+fn submitted_user_turn_markers(events: &[Value]) -> Vec<&Value> {
+    events
+        .iter()
+        .filter(|event| event["kind"] == "marker")
+        .filter(|event| event["name"] == "oulipoly.submitted_user_turn")
+        .collect()
 }
 
 #[test]
