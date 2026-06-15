@@ -40,8 +40,18 @@ impl<W: Write> EventWriter<W> {
     }
 
     pub fn exit(&mut self, status: Value, terminal_signal: Value) -> io::Result<()> {
+        self.exit_with_session(status, terminal_signal, None)
+    }
+
+    // declared_role: formatter
+    pub fn exit_with_session(
+        &mut self,
+        status: Value,
+        terminal_signal: Value,
+        session: Option<Value>,
+    ) -> io::Result<()> {
         let seq = self.next_seq();
-        let line = exit_line(&self.request_id, seq, status, terminal_signal)?;
+        let line = exit_line(&self.request_id, seq, status, terminal_signal, session)?;
         self.emit_line(&line)
     }
 
@@ -96,8 +106,9 @@ fn exit_line(
     seq: u64,
     status: Value,
     terminal_signal: Value,
+    session: Option<Value>,
 ) -> io::Result<Vec<u8>> {
-    event_line(json!({
+    let mut event = json!({
         "contract": CONTRACT,
         "request_id": request_id,
         "seq": seq,
@@ -105,7 +116,11 @@ fn exit_line(
         "kind": "exit",
         "status": status,
         "terminal_signal": terminal_signal,
-    }))
+    });
+    if let Some(session) = session {
+        event["session"] = session;
+    }
+    event_line(event)
 }
 
 fn event_line(event: Value) -> io::Result<Vec<u8>> {

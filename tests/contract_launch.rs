@@ -427,6 +427,40 @@ fn launch_non_clean_resume_emits_no_submitted_user_turn_marker() {
     assert_no_submitted_user_turn_marker(output);
 }
 
+#[test]
+fn launch_fresh_exit_reports_stdout_provider_session_id() {
+    let roots = temp_roots("launch-fresh-provider-session-id");
+    let script = stdout_session_fixture(&roots, "claude-fresh-session-123");
+
+    let request = launch_request(&roots, vec![path_string(&script)], json!({}));
+    let output = invoke("launch", &request);
+    let events = assert_valid_launch_invocation(output);
+    assert_exit_provider_session_id(&events, "claude-fresh-session-123");
+}
+
+#[test]
+fn launch_resume_exit_reports_known_provider_session_id() {
+    let roots = temp_roots("launch-resume-provider-session-id");
+    let script = stdout_session_stdin_sink_fixture(&roots, "stdout-should-not-win");
+    let prompt = "Notifications delivered:\n[OULIPOLY-DELIVERY nonce-resume-session]\n";
+
+    let request = resume_stdin_request(&roots, &script, prompt, Some("known-resume-session-456"));
+    let output = invoke("launch", &request);
+    let events = assert_valid_launch_invocation(output);
+    assert_exit_provider_session_id(&events, "known-resume-session-456");
+}
+
+#[test]
+fn launch_exit_omits_session_when_no_provider_session_id_resolves() {
+    let roots = temp_roots("launch-no-provider-session-id");
+    let script = no_session_stdout_fixture(&roots);
+
+    let request = launch_request(&roots, vec![path_string(&script)], json!({}));
+    let output = invoke("launch", &request);
+    let events = assert_valid_launch_invocation(output);
+    assert_exit_has_no_session(&events);
+}
+
 // declared_role: orchestration
 fn stdin_sink_fixture(roots: &support::fixtures::TempRoots, exit_code: i32) -> PathBuf {
     let script = roots.root.join(format!("stdin-sink-{exit_code}.sh"));
@@ -434,9 +468,61 @@ fn stdin_sink_fixture(roots: &support::fixtures::TempRoots, exit_code: i32) -> P
     script
 }
 
+// declared_role: orchestration
+fn stdout_session_fixture(roots: &support::fixtures::TempRoots, session_id: &str) -> PathBuf {
+    let script = roots.root.join("stdout-session.sh");
+    write_executable(&script, &stdout_session_script(session_id));
+    script
+}
+
+// declared_role: orchestration
+fn stdout_session_stdin_sink_fixture(
+    roots: &support::fixtures::TempRoots,
+    session_id: &str,
+) -> PathBuf {
+    let script = roots.root.join("stdout-session-stdin-sink.sh");
+    write_executable(&script, &stdout_session_stdin_sink_script(session_id));
+    script
+}
+
+// declared_role: orchestration
+fn no_session_stdout_fixture(roots: &support::fixtures::TempRoots) -> PathBuf {
+    let script = roots.root.join("no-session-stdout.sh");
+    write_executable(&script, no_session_stdout_script());
+    script
+}
+
 // declared_role: formatter
 fn stdin_sink_script(exit_code: i32) -> String {
     format!("#!/bin/sh\n/bin/cat >/dev/null\nexit {exit_code}\n")
+}
+
+// declared_role: formatter
+fn stdout_session_script(session_id: &str) -> String {
+    format!(
+        "#!/bin/sh\n{}exit 0\n",
+        stdout_session_line_script(session_id)
+    )
+}
+
+// declared_role: formatter
+fn stdout_session_stdin_sink_script(session_id: &str) -> String {
+    format!(
+        "#!/bin/sh\n{}/bin/cat >/dev/null\nexit 0\n",
+        stdout_session_line_script(session_id)
+    )
+}
+
+// declared_role: formatter
+fn stdout_session_line_script(session_id: &str) -> String {
+    format!(
+        "cat <<'JSON'\n{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"{session_id}\"}}\nJSON\n"
+    )
+}
+
+// declared_role: formatter
+fn no_session_stdout_script() -> &'static str {
+    "#!/bin/sh\nprintf 'not a claude session event\\n'\nexit 0\n"
 }
 
 // declared_role: formatter
@@ -490,6 +576,26 @@ fn assert_no_submitted_user_turn_marker(output: support::invoke::Invocation) {
     assert!(
         markers.is_empty(),
         "submitted marker must not be emitted: {events:?}"
+    );
+}
+
+// declared_role: validator
+fn assert_exit_provider_session_id(events: &[Value], expected_session_id: &str) {
+    let event = events.last().expect("launch stream has final event");
+    assert_eq!(event["kind"], "exit");
+    assert_eq!(
+        event["session"]["provider_session_id"], expected_session_id,
+        "exit event must report provider session id: {event}"
+    );
+}
+
+// declared_role: validator
+fn assert_exit_has_no_session(events: &[Value]) {
+    let event = events.last().expect("launch stream has final event");
+    assert_eq!(event["kind"], "exit");
+    assert!(
+        event.get("session").is_none(),
+        "exit event must omit session when no id resolves: {event}"
     );
 }
 

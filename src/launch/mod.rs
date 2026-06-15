@@ -1,4 +1,4 @@
-// declared_role: orchestration, validator, predicate, mapper, accessor, formatter
+// declared_role: orchestration, validator, predicate, mapper, accessor, formatter, filter
 // intrinsic_surface_declarations:
 //   - component: src/launch/mod.rs
 //     role: intrinsic-surface
@@ -32,11 +32,34 @@ use crate::envelope::error::{ErrorCategory, ProviderFailure};
 
 const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const FINAL_DRAIN_GRACE: Duration = Duration::from_millis(100);
+const STDOUT_SESSION_ID_PREFIX_CAP: usize = 256 * 1024;
 
 #[derive(Clone, Copy)]
 enum DrainStatus {
     Open,
     Disconnected,
+}
+
+#[derive(Default)]
+struct StdoutPrefixAccumulator {
+    bytes: Vec<u8>,
+}
+
+impl StdoutPrefixAccumulator {
+    // declared_role: mapper
+    fn record_stdout_prefix(&mut self, bytes: &[u8]) {
+        if self.bytes.len() >= STDOUT_SESSION_ID_PREFIX_CAP {
+            return;
+        }
+        let remaining = STDOUT_SESSION_ID_PREFIX_CAP - self.bytes.len();
+        let len = bytes.len().min(remaining);
+        self.bytes.extend_from_slice(&bytes[..len]);
+    }
+
+    // declared_role: accessor
+    fn stdout(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 pub fn handle(_subcommand: &str, request: &RequestEnvelope) -> Result<Value, ProviderFailure> {
@@ -186,9 +209,23 @@ fn stream_launch_and_exit(
 ) -> ! {
     let stdout = io::stdout();
     let mut events = events::EventWriter::new(stdout.lock(), request_id);
-    let status = launch_status(&mut events, argv, cwd, env, stdin_bytes, deadline);
+    let mut stdout_prefix = StdoutPrefixAccumulator::default();
+    let status = launch_status(
+        &mut events,
+        argv,
+        cwd,
+        env,
+        stdin_bytes,
+        deadline,
+        &mut stdout_prefix,
+    );
     emit_submitted_user_turn_marker(&mut events, &status, resume_confirmation.as_ref());
-    emit_terminal_exit(&mut events, status);
+    emit_terminal_exit(
+        &mut events,
+        status,
+        resume_confirmation.as_ref(),
+        stdout_prefix.stdout(),
+    );
     std::process::exit(0);
 }
 
@@ -217,9 +254,12 @@ fn launch_status<W: Write>(
     env: &BTreeMap<String, String>,
     stdin_bytes: Vec<u8>,
     deadline: Option<u64>,
+    stdout_prefix: &mut StdoutPrefixAccumulator,
 ) -> Value {
     match child::RunningChild::spawn(argv, cwd, env, stdin_bytes) {
-        Ok((mut child, pipes)) => spawned_child_status(events, &mut child, pipes, deadline),
+        Ok((mut child, pipes)) => {
+            spawned_child_status(events, &mut child, pipes, deadline, stdout_prefix)
+        }
         Err(error) => spawn_error_status(&error),
     }
 }
@@ -229,13 +269,14 @@ fn spawned_child_status<W: Write>(
     child: &mut child::RunningChild,
     pipes: child::ChildPipes,
     deadline: Option<u64>,
+    stdout_prefix: &mut StdoutPrefixAccumulator,
 ) -> Value {
     emit_child_started(events);
     let (receiver, stdout_thread, stderr_thread) = spawn_pipe_drains(pipes);
-    let status = wait_child_while_draining(events, child, &receiver, deadline);
-    if !drain_for(events, &receiver, FINAL_DRAIN_GRACE) {
+    let status = wait_child_while_draining(events, child, &receiver, deadline, stdout_prefix);
+    if !drain_for(events, &receiver, FINAL_DRAIN_GRACE, stdout_prefix) {
         child.terminate_descendants();
-        let _ = drain_for(events, &receiver, FINAL_DRAIN_GRACE);
+        let _ = drain_for(events, &receiver, FINAL_DRAIN_GRACE, stdout_prefix);
     }
     drop(stdout_thread);
     drop(stderr_thread);
@@ -265,9 +306,10 @@ fn wait_child_while_draining<W: Write>(
     child: &mut child::RunningChild,
     receiver: &mpsc::Receiver<drain::DrainEvent>,
     deadline: Option<u64>,
+    stdout_prefix: &mut StdoutPrefixAccumulator,
 ) -> Value {
     loop {
-        drain_once(events, receiver, DRAIN_POLL_INTERVAL);
+        drain_once(events, receiver, DRAIN_POLL_INTERVAL, stdout_prefix);
         if let Some(status) = child.poll_status() {
             return status;
         }
@@ -281,19 +323,21 @@ fn drain_for<W: Write>(
     events: &mut events::EventWriter<W>,
     receiver: &mpsc::Receiver<drain::DrainEvent>,
     duration: Duration,
+    stdout_prefix: &mut StdoutPrefixAccumulator,
 ) -> bool {
-    drain_completed(drain_for_status(events, receiver, duration))
+    drain_completed(drain_for_status(events, receiver, duration, stdout_prefix))
 }
 
 fn drain_for_status<W: Write>(
     events: &mut events::EventWriter<W>,
     receiver: &mpsc::Receiver<drain::DrainEvent>,
     duration: Duration,
+    stdout_prefix: &mut StdoutPrefixAccumulator,
 ) -> DrainStatus {
     let started = Instant::now();
     while started.elapsed() < duration {
         let remaining = duration.saturating_sub(started.elapsed());
-        if drain_completed(drain_once(events, receiver, remaining)) {
+        if drain_completed(drain_once(events, receiver, remaining, stdout_prefix)) {
             return DrainStatus::Disconnected;
         }
     }
@@ -304,9 +348,10 @@ fn drain_once<W: Write>(
     events: &mut events::EventWriter<W>,
     receiver: &mpsc::Receiver<drain::DrainEvent>,
     timeout: Duration,
+    stdout_prefix: &mut StdoutPrefixAccumulator,
 ) -> DrainStatus {
     match receive_drain_event(receiver, timeout) {
-        Ok(event) => drain_received_event(events, event),
+        Ok(event) => drain_received_event(events, event, stdout_prefix),
         Err(error) => drain_error_status(error),
     }
 }
@@ -321,8 +366,9 @@ fn receive_drain_event(
 fn drain_received_event<W: Write>(
     events: &mut events::EventWriter<W>,
     event: drain::DrainEvent,
+    stdout_prefix: &mut StdoutPrefixAccumulator,
 ) -> DrainStatus {
-    emit_drain_event(events, event);
+    emit_drain_event(events, event, stdout_prefix);
     DrainStatus::Open
 }
 
@@ -337,9 +383,26 @@ fn drain_completed(status: DrainStatus) -> bool {
     matches!(status, DrainStatus::Disconnected)
 }
 
-fn emit_drain_event<W: Write>(events: &mut events::EventWriter<W>, event: drain::DrainEvent) {
+// declared_role: orchestration
+fn emit_drain_event<W: Write>(
+    events: &mut events::EventWriter<W>,
+    event: drain::DrainEvent,
+    stdout_prefix: &mut StdoutPrefixAccumulator,
+) {
     let (channel, bytes) = drain_event_data(event);
+    record_stdout_channel_prefix(stdout_prefix, channel, &bytes);
     emit_stream_data(events, channel, &bytes);
+}
+
+// declared_role: filter
+fn record_stdout_channel_prefix(
+    stdout_prefix: &mut StdoutPrefixAccumulator,
+    channel: &str,
+    bytes: &[u8],
+) {
+    if channel == "stdout" {
+        stdout_prefix.record_stdout_prefix(bytes);
+    }
 }
 
 fn drain_event_data(event: drain::DrainEvent) -> (&'static str, Vec<u8>) {
@@ -354,9 +417,37 @@ fn emit_stream_data<W: Write>(
     let _ = events.data(channel, bytes);
 }
 
-fn emit_terminal_exit<W: Write>(events: &mut events::EventWriter<W>, status: Value) {
+// declared_role: orchestration
+fn emit_terminal_exit<W: Write>(
+    events: &mut events::EventWriter<W>,
+    status: Value,
+    resume_confirmation: Option<&submitted_user_turn::ResumeConfirmation>,
+    stdout: &[u8],
+) {
     let signal = terminal_signal(&status);
-    let _ = events.exit(status, signal);
+    let session = exit_session_object(launch_session_provider_id(resume_confirmation, stdout));
+    let _ = events.exit_with_session(status, signal, session);
+}
+
+// declared_role: formatter
+fn exit_session_object(provider_session_id: Option<String>) -> Option<Value> {
+    provider_session_id.map(|provider_session_id| json!({ "provider_session_id": provider_session_id }))
+}
+
+// declared_role: mapper
+fn launch_session_provider_id(
+    resume: Option<&submitted_user_turn::ResumeConfirmation>,
+    stdout: &[u8],
+) -> Option<String> {
+    resume_provider_session_id(resume)
+        .or_else(|| crate::session::stdout_session_id::extract_stdout_session_id(stdout))
+}
+
+// declared_role: accessor
+fn resume_provider_session_id(
+    resume: Option<&submitted_user_turn::ResumeConfirmation>,
+) -> Option<String> {
+    resume.map(|confirmation| confirmation.session_id().to_string())
 }
 
 fn deadline_elapsed(deadline: Option<u64>) -> bool {

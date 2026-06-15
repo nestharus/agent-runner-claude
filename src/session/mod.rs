@@ -20,6 +20,7 @@ pub mod locate;
 pub mod native_claude;
 pub mod read_turns;
 pub mod replace;
+pub mod stdout_session_id;
 pub mod storage;
 pub mod types;
 

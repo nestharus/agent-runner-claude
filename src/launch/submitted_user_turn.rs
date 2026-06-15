@@ -14,6 +14,13 @@ pub struct ResumeConfirmation {
     delivery_nonce: Option<String>,
 }
 
+impl ResumeConfirmation {
+    // declared_role: accessor
+    pub fn session_id(&self) -> &str {
+        self.session_id.as_str()
+    }
+}
+
 struct SubmittedResumePayload<'a> {
     bytes: &'a [u8],
     text: Option<&'a str>,

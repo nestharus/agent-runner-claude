@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 use crate::envelope::decode::RequestEnvelope;
 use crate::envelope::error::ProviderFailure;
 
+use super::stdout_session_id::extract_stdout_session_id;
 use super::types::{optional_string, parse_base_params, required_string};
 
 pub fn handle(request: &RequestEnvelope) -> Result<Value, ProviderFailure> {
@@ -120,25 +121,6 @@ fn start_known_response(provider_session_id: String) -> Value {
     })
 }
 
-fn extract_stdout_session_id(stdout: &[u8]) -> Option<String> {
-    stdout_json_values(stdout)
-        .into_iter()
-        .find_map(|value| stdout_capture_session_id(&value))
-}
-
-fn stdout_json_values(stdout: &[u8]) -> Vec<Value> {
-    let text = String::from_utf8_lossy(stdout);
-    text.lines().filter_map(parse_json_line).collect()
-}
-
-fn stdout_capture_session_id(value: &Value) -> Option<String> {
-    is_stdout_capture_event(value).then(|| stdout_capture_session_id_value(value))?
-}
-
-fn stdout_capture_session_id_value(value: &Value) -> Option<String> {
-    json_session_id(value).map(str::to_string)
-}
-
 fn confined_evidence_path(
     request: &RequestEnvelope,
 ) -> Result<std::path::PathBuf, ProviderFailure> {
@@ -189,23 +171,23 @@ fn marker_session_id_string(line: &str) -> Option<String> {
 }
 
 fn json_evidence_session_id(line: &str) -> Option<String> {
-    let value = parse_json_line(line)?;
+    let value = parse_evidence_json_line(line)?;
     evidence_capture_session_id(&value)
 }
 
 fn evidence_capture_session_id(value: &Value) -> Option<String> {
-    is_evidence_capture_event(value).then(|| json_session_id_string(value))?
+    is_evidence_capture_event(value).then(|| evidence_json_session_id_string(value))?
 }
 
-fn json_session_id_string(value: &Value) -> Option<String> {
-    json_session_id(value).map(str::to_string)
+fn evidence_json_session_id_string(value: &Value) -> Option<String> {
+    evidence_json_session_id(value).map(str::to_string)
 }
 
-fn parse_json_line(line: &str) -> Option<Value> {
+fn parse_evidence_json_line(line: &str) -> Option<Value> {
     serde_json::from_str::<Value>(line.trim()).ok()
 }
 
-fn json_session_id(value: &Value) -> Option<&str> {
+fn evidence_json_session_id(value: &Value) -> Option<&str> {
     value
         .get("session_id")
         .or_else(|| value.get("sessionId"))
@@ -213,19 +195,13 @@ fn json_session_id(value: &Value) -> Option<&str> {
         .filter(|session_id| !session_id.is_empty())
 }
 
-fn is_stdout_capture_event(value: &Value) -> bool {
-    string_field_equals(value, "type", "system")
-        && string_field_equals(value, "subtype", "init")
-        && json_session_id(value).is_some()
-}
-
 fn is_evidence_capture_event(value: &Value) -> bool {
-    string_field_equals(value, "type", "claude_session_capture_event")
-        || string_field_equals(value, "subtype", "claude_session_capture_event")
-        || string_field_equals(value, "event", "claude_session_capture_event")
+    evidence_string_field_equals(value, "type", "claude_session_capture_event")
+        || evidence_string_field_equals(value, "subtype", "claude_session_capture_event")
+        || evidence_string_field_equals(value, "event", "claude_session_capture_event")
 }
 
-fn string_field_equals(value: &Value, key: &str, expected: &str) -> bool {
+fn evidence_string_field_equals(value: &Value, key: &str, expected: &str) -> bool {
     value.get(key).and_then(Value::as_str) == Some(expected)
 }
 
