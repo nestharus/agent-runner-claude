@@ -105,6 +105,31 @@ fn native_line(
     record.to_string()
 }
 
+fn native_turn_line_without_session_id(
+    uuid: &str,
+    typ: &str,
+    role: &str,
+    content: Value,
+) -> String {
+    json!({
+        "uuid": uuid,
+        "parentUuid": "parent-turn",
+        "timestamp": "2026-06-04T00:00:00.000Z",
+        "type": typ,
+        "message": { "role": role, "content": content }
+    })
+    .to_string()
+}
+
+fn native_metadata_line(session_id: &str, typ: &str) -> String {
+    json!({
+        "sessionId": session_id,
+        "timestamp": "2026-06-04T00:00:00.000Z",
+        "type": typ
+    })
+    .to_string()
+}
+
 fn normalized_turn_lines() -> Vec<String> {
     vec![
         native_line(
@@ -127,6 +152,20 @@ fn normalized_turn_lines() -> Vec<String> {
             "user",
             Some("user"),
             json!({ "type": "text", "text": "fallback" }),
+        ),
+    ]
+}
+
+fn claude_turn_lines_without_per_line_session_id() -> Vec<String> {
+    vec![
+        native_metadata_line("sess-native-no-turn-sid", "queue-operation"),
+        native_turn_line_without_session_id("u-native-user", "user", "user", json!("hello")),
+        native_metadata_line("sess-native-no-turn-sid", "last-prompt"),
+        native_turn_line_without_session_id(
+            "u-native-assistant",
+            "assistant",
+            "assistant",
+            json!([{ "type": "text", "text": "hi" }]),
         ),
     ]
 }
@@ -174,6 +213,11 @@ fn after_turn_lines() -> Vec<String> {
 fn write_normalized_turns_fixture(roots: &TempRoots) {
     let path = prepared_transcript_path(roots, "-tmp-work", "conversation.jsonl");
     write_lines(&path, &normalized_turn_lines());
+}
+
+fn write_claude_turns_without_per_line_session_id_fixture(roots: &TempRoots) {
+    let path = prepared_transcript_path(roots, "-tmp-work", "native-no-turn-sid.jsonl");
+    write_lines(&path, &claude_turn_lines_without_per_line_session_id());
 }
 
 fn write_zero_turn_fixture(roots: &TempRoots) -> PathBuf {
@@ -232,6 +276,7 @@ fn assert_normalized_turns_response(code: Option<i32>, response: &Value) {
     assert!(response["result"]["complete"].as_bool().unwrap());
     assert_eq!(response["result"]["turn_count"], 3);
     let turns = response["result"]["turns"].as_array().unwrap();
+    assert_turns_session_id(turns, "sess-read");
     assert_eq!(turns[0]["id"], "uuid:u-user");
     assert_eq!(turns[0]["role"], "user");
     assert_text_body(&turns[0]["body"], "hello");
@@ -240,6 +285,30 @@ fn assert_normalized_turns_response(code: Option<i32>, response: &Value) {
     assert_text_body(&turns[1]["body"], "hi");
     assert_eq!(turns[2]["id"], "line:3");
     assert_text_body(&turns[2]["body"], "fallback");
+}
+
+fn assert_turns_session_id(turns: &[Value], expected: &str) {
+    for turn in turns {
+        assert_eq!(turn["session_id"], expected);
+    }
+}
+
+fn assert_claude_turns_without_per_line_session_id_response(code: Option<i32>, response: &Value) {
+    assert_eq!(code, Some(0));
+    assert_valid(
+        "session.schema.json#/$defs/SessionReadTurnsResponse",
+        response,
+    );
+    assert!(response["result"]["complete"].as_bool().unwrap());
+    assert_eq!(response["result"]["turn_count"], 2);
+    let turns = response["result"]["turns"].as_array().unwrap();
+    assert_turns_session_id(turns, "sess-native-no-turn-sid");
+    assert_eq!(turns[0]["id"], "uuid:u-native-user");
+    assert_eq!(turns[0]["role"], "user");
+    assert_text_body(&turns[0]["body"], "hello");
+    assert_eq!(turns[1]["id"], "uuid:u-native-assistant");
+    assert_eq!(turns[1]["role"], "assistant");
+    assert_text_body(&turns[1]["body"], "hi");
 }
 
 fn assert_zero_turn_response(code: Option<i32>, response: &Value) {
@@ -289,6 +358,16 @@ fn read_turns_normalizes_roles_body_variants_and_stable_ids_from_uuid_or_line() 
     let (code, response) = call(&roots, read_turns_request("sess-read"));
 
     assert_normalized_turns_response(code, &response);
+}
+
+#[test]
+fn read_turns_stamps_requested_session_id_on_claude_turns_without_per_line_session_id() {
+    let roots = temp_roots("session-read-native-no-turn-sid");
+    write_claude_turns_without_per_line_session_id_fixture(&roots);
+
+    let (code, response) = call(&roots, read_turns_request("sess-native-no-turn-sid"));
+
+    assert_claude_turns_without_per_line_session_id_response(code, &response);
 }
 
 #[test]

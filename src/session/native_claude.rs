@@ -17,6 +17,7 @@ pub struct NativeRecord {
 #[derive(Debug, Clone)]
 pub struct NativeTurn {
     pub id: String,
+    pub session_id: String,
     pub role: String,
     pub body: Value,
     pub timestamp: Option<String>,
@@ -71,7 +72,7 @@ pub fn text_contains_session(text: &str, session_id: &str) -> bool {
 pub fn turns_for_session(parse: &NativeParse, session_id: &str) -> Vec<NativeTurn> {
     turn_records_for_session(parse, session_id)
         .into_iter()
-        .map(turn_from_record)
+        .map(|record| turn_from_record(record, session_id))
         .collect()
 }
 
@@ -85,19 +86,11 @@ pub fn canonical_records_for_session(
         .collect()
 }
 
-pub fn turn_from_record(record: &NativeRecord) -> NativeTurn {
-    let record_type = record_type(&record.value).unwrap_or("user");
-    let role = record
-        .value
-        .get("message")
-        .and_then(|message| message.get("role"))
-        .and_then(Value::as_str)
-        .unwrap_or(record_type)
-        .to_string();
-
+pub fn turn_from_record(record: &NativeRecord, session_id: &str) -> NativeTurn {
     NativeTurn {
         id: stable_id(&record.value, record.line_number),
-        role,
+        session_id: session_id.to_string(),
+        role: turn_role(record),
         body: normalized_body(&record.value),
         timestamp: record_timestamp(record),
     }
@@ -120,7 +113,7 @@ pub fn canonical_from_record(record: &NativeRecord) -> CanonicalRecord {
             body: normalized_body(&record.value),
         }
     } else {
-        canonical_turn(turn_from_record(record), timestamp)
+        canonical_turn_from_record(record, timestamp)
     }
 }
 
@@ -137,6 +130,10 @@ impl NativeParse {
 }
 
 fn turn_records_for_session<'a>(parse: &'a NativeParse, session_id: &str) -> Vec<&'a NativeRecord> {
+    if !parse.contains_session(session_id) {
+        return Vec::new();
+    }
+
     parse
         .records
         .iter()
@@ -156,7 +153,7 @@ fn canonical_record_refs_for_session<'a>(
 }
 
 fn is_turn_record_for_session(record: &NativeRecord, session_id: &str) -> bool {
-    record_matches_session(&record.value, session_id)
+    (record_matches_session(&record.value, session_id) || !record_has_session_id(&record.value))
         && !is_sidechain(&record.value)
         && is_turn_type(record_type(&record.value))
 }
@@ -195,14 +192,25 @@ fn record_timestamp(record: &NativeRecord) -> Option<String> {
         .map(str::to_string)
 }
 
-fn canonical_turn(turn: NativeTurn, timestamp: String) -> CanonicalRecord {
+fn canonical_turn_from_record(record: &NativeRecord, timestamp: String) -> CanonicalRecord {
     CanonicalRecord {
         record_type: "turn".to_string(),
-        id: turn.id,
-        role: turn.role,
+        id: stable_id(&record.value, record.line_number),
+        role: turn_role(record),
         timestamp,
-        body: turn.body,
+        body: normalized_body(&record.value),
     }
+}
+
+fn turn_role(record: &NativeRecord) -> String {
+    let record_type = record_type(&record.value).unwrap_or("user");
+    record
+        .value
+        .get("message")
+        .and_then(|message| message.get("role"))
+        .and_then(Value::as_str)
+        .unwrap_or(record_type)
+        .to_string()
 }
 
 fn native_values(session_id: &str, records: &[CanonicalRecord]) -> Vec<Value> {
@@ -257,6 +265,11 @@ fn native_turn_value(session_id: &str, record: &CanonicalRecord) -> Value {
 fn record_matches_session(value: &Value, session_id: &str) -> bool {
     value.get("sessionId").and_then(Value::as_str) == Some(session_id)
         || value.get("session_id").and_then(Value::as_str) == Some(session_id)
+}
+
+fn record_has_session_id(value: &Value) -> bool {
+    value.get("sessionId").and_then(Value::as_str).is_some()
+        || value.get("session_id").and_then(Value::as_str).is_some()
 }
 
 fn is_sidechain(value: &Value) -> bool {
