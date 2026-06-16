@@ -155,6 +155,7 @@ fn turn_values(turns: Vec<NativeTurn>) -> Vec<Value> {
 fn turn_value(turn: NativeTurn) -> Value {
     json!({
         "id": turn.id,
+        "session_id": turn.session_id,
         "role": turn.role,
         "body": turn.body,
     })
