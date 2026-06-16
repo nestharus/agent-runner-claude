@@ -29,6 +29,8 @@ use support::requests::{launch_request, launch_timeout_request};
 use support::schema::assert_valid;
 use support::scripts::write_executable;
 
+const LAUNCH_HEARTBEAT_INTERVAL_MS_ENV: &str = "AGENT_RUNNER_CLAUDE_LAUNCH_HEARTBEAT_INTERVAL_MS";
+
 fn assert_launch_event_valid(event: &Value) {
     assert_launch_event_schema(event_schema_id(event), event);
 }
@@ -127,13 +129,30 @@ fn invoke_launch_with_timeout(
 }
 
 fn spawn_launch_provider() -> Child {
-    Command::new(env!("CARGO_BIN_EXE_agent-runner-claude"))
+    launch_provider_command()
+        .spawn()
+        .expect("spawn launch provider")
+}
+
+// declared_role: orchestration
+fn spawn_launch_provider_with_heartbeat_interval(interval: Duration) -> Child {
+    let mut command = launch_provider_command();
+    command.env(
+        LAUNCH_HEARTBEAT_INTERVAL_MS_ENV,
+        interval.as_millis().to_string(),
+    );
+    command.spawn().expect("spawn launch provider")
+}
+
+// declared_role: formatter
+fn launch_provider_command() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agent-runner-claude"));
+    command
         .arg("launch")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn launch provider")
+        .stderr(Stdio::piped());
+    command
 }
 
 fn write_child_stdin(child: &mut Child, stdin: &[u8]) {
@@ -156,6 +175,17 @@ fn wait_for_launch_provider(
         }
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+// declared_role: orchestration
+fn invoke_launch_with_heartbeat_interval(
+    envelope: &Value,
+    heartbeat_interval: Duration,
+    timeout: Duration,
+) -> Result<support::invoke::Invocation, String> {
+    let mut child = spawn_launch_provider_with_heartbeat_interval(heartbeat_interval);
+    write_child_stdin(&mut child, envelope.to_string().as_bytes());
+    wait_for_launch_provider(child, timeout)
 }
 
 fn launch_provider_timed_out(started: Instant, timeout: Duration) -> bool {
@@ -417,6 +447,92 @@ fn assert_descendant_stdio_output(output: support::invoke::Invocation) {
         json!({ "kind": "exited", "code": 0 })
     );
     assert_eq!(final_event["terminal_signal"]["kind"], "clean_exit");
+}
+
+// declared_role: validator
+#[test]
+fn launch_emits_periodic_heartbeats_while_child_is_silent() {
+    let roots = temp_roots("launch-periodic-heartbeat");
+    let script = silent_child_fixture(&roots);
+    let heartbeat_interval = Duration::from_millis(200);
+
+    let request = launch_request(&roots, vec![path_string(&script)], json!({}));
+    let output =
+        invoke_launch_with_heartbeat_interval(&request, heartbeat_interval, Duration::from_secs(5))
+            .expect("silent launch provider exits after emitting periodic heartbeats");
+    assert_periodic_heartbeat_invocation(output, Duration::from_millis(500));
+}
+
+// declared_role: orchestration
+fn silent_child_fixture(roots: &support::fixtures::TempRoots) -> PathBuf {
+    let script = roots.root.join("silent-child.sh");
+    write_executable(&script, "#!/bin/sh\nsleep 1\nexit 0\n");
+    script
+}
+
+// declared_role: validator
+fn assert_periodic_heartbeat_invocation(
+    output: support::invoke::Invocation,
+    max_event_gap: Duration,
+) {
+    assert_eq!(output.code, Some(0));
+    assert!(output.stderr.is_empty());
+    let events = collect_launch_jsonl_lines(&output);
+    for event in &events {
+        assert_launch_event_valid(event);
+    }
+    assert_seq_starts_at_one_and_monotonic(&events);
+    assert_single_terminal_exit(&events);
+    assert_alive_heartbeats_emitted(&events, 3);
+    assert_adjacent_event_gaps_under(&events, max_event_gap);
+}
+
+// declared_role: validator
+fn assert_single_terminal_exit(events: &[Value]) {
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["kind"] == "exit")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events.last().expect("launch stream final event")["kind"],
+        "exit"
+    );
+}
+
+// declared_role: validator
+fn assert_alive_heartbeats_emitted(events: &[Value], minimum: usize) {
+    let alive_heartbeats = events
+        .iter()
+        .filter(|event| event["kind"] == "heartbeat")
+        .filter(|event| event["detail"] == "alive")
+        .count();
+    assert!(
+        alive_heartbeats >= minimum,
+        "expected at least {minimum} periodic heartbeats: {events:?}"
+    );
+}
+
+// declared_role: validator
+fn assert_adjacent_event_gaps_under(events: &[Value], max_gap: Duration) {
+    let max_gap_ms = max_gap.as_millis() as u64;
+    for pair in events.windows(2) {
+        let before = event_time_unix_ms(&pair[0]);
+        let after = event_time_unix_ms(&pair[1]);
+        assert!(
+            after.saturating_sub(before) <= max_gap_ms,
+            "adjacent launch events exceeded {max_gap:?}: {events:?}"
+        );
+    }
+}
+
+// declared_role: accessor
+fn event_time_unix_ms(event: &Value) -> u64 {
+    event["time_unix_ms"]
+        .as_u64()
+        .expect("launch event timestamp")
 }
 
 #[test]

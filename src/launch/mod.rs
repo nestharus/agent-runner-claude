@@ -32,6 +32,10 @@ use crate::envelope::error::{ErrorCategory, ProviderFailure};
 
 const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const FINAL_DRAIN_GRACE: Duration = Duration::from_millis(100);
+const LAUNCH_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const LAUNCH_HEARTBEAT_DETAIL: &str = "alive";
+#[cfg(debug_assertions)]
+const LAUNCH_HEARTBEAT_INTERVAL_MS_ENV: &str = "AGENT_RUNNER_CLAUDE_LAUNCH_HEARTBEAT_INTERVAL_MS";
 const STDOUT_SESSION_ID_PREFIX_CAP: usize = 256 * 1024;
 const CLAUDE_RESUME_FLAG: &str = "--resume";
 const CLAUDE_SESSION_ID_FLAG: &str = "--session-id";
@@ -45,6 +49,31 @@ enum DrainStatus {
 #[derive(Default)]
 struct StdoutPrefixAccumulator {
     bytes: Vec<u8>,
+}
+
+struct LaunchHeartbeatPacer {
+    last_event: Instant,
+    interval: Duration,
+}
+
+impl LaunchHeartbeatPacer {
+    // declared_role: mapper
+    fn new(last_event: Instant, interval: Duration) -> Self {
+        Self {
+            last_event,
+            interval,
+        }
+    }
+
+    // declared_role: mapper
+    fn note_event(&mut self, emitted_at: Instant) {
+        self.last_event = emitted_at;
+    }
+
+    // declared_role: predicate
+    fn due(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.last_event) >= self.interval
+    }
 }
 
 impl StdoutPrefixAccumulator {
@@ -362,15 +391,65 @@ fn spawned_child_status<W: Write>(
     stdout_prefix: &mut StdoutPrefixAccumulator,
 ) -> Value {
     emit_child_started(events);
+    let mut heartbeat = LaunchHeartbeatPacer::new(Instant::now(), launch_heartbeat_interval());
     let (receiver, stdout_thread, stderr_thread) = spawn_pipe_drains(pipes);
-    let status = wait_child_while_draining(events, child, &receiver, deadline, stdout_prefix);
-    if !drain_for(events, &receiver, FINAL_DRAIN_GRACE, stdout_prefix) {
+    let status = wait_child_while_draining(
+        events,
+        child,
+        &receiver,
+        deadline,
+        stdout_prefix,
+        &mut heartbeat,
+    );
+    if !drain_for(
+        events,
+        &receiver,
+        FINAL_DRAIN_GRACE,
+        stdout_prefix,
+        &mut heartbeat,
+    ) {
         child.terminate_descendants();
-        let _ = drain_for(events, &receiver, FINAL_DRAIN_GRACE, stdout_prefix);
+        let _ = drain_for(
+            events,
+            &receiver,
+            FINAL_DRAIN_GRACE,
+            stdout_prefix,
+            &mut heartbeat,
+        );
     }
     drop(stdout_thread);
     drop(stderr_thread);
     status
+}
+
+// declared_role: accessor
+fn launch_heartbeat_interval() -> Duration {
+    #[cfg(debug_assertions)]
+    {
+        debug_launch_heartbeat_interval().unwrap_or(LAUNCH_HEARTBEAT_INTERVAL)
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        LAUNCH_HEARTBEAT_INTERVAL
+    }
+}
+
+#[cfg(debug_assertions)]
+// declared_role: mapper
+fn debug_launch_heartbeat_interval() -> Option<Duration> {
+    std::env::var(LAUNCH_HEARTBEAT_INTERVAL_MS_ENV)
+        .ok()
+        .and_then(parse_positive_millis_duration)
+}
+
+#[cfg(debug_assertions)]
+// declared_role: mapper
+fn parse_positive_millis_duration(value: String) -> Option<Duration> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|millis| *millis > 0)
+        .map(Duration::from_millis)
 }
 
 fn emit_child_started<W: Write>(events: &mut events::EventWriter<W>) {
@@ -397,9 +476,16 @@ fn wait_child_while_draining<W: Write>(
     receiver: &mpsc::Receiver<drain::DrainEvent>,
     deadline: Option<u64>,
     stdout_prefix: &mut StdoutPrefixAccumulator,
+    heartbeat: &mut LaunchHeartbeatPacer,
 ) -> Value {
     loop {
-        drain_once(events, receiver, DRAIN_POLL_INTERVAL, stdout_prefix);
+        drain_once(
+            events,
+            receiver,
+            DRAIN_POLL_INTERVAL,
+            stdout_prefix,
+            heartbeat,
+        );
         if let Some(status) = child.poll_status() {
             return status;
         }
@@ -414,8 +500,15 @@ fn drain_for<W: Write>(
     receiver: &mpsc::Receiver<drain::DrainEvent>,
     duration: Duration,
     stdout_prefix: &mut StdoutPrefixAccumulator,
+    heartbeat: &mut LaunchHeartbeatPacer,
 ) -> bool {
-    drain_completed(drain_for_status(events, receiver, duration, stdout_prefix))
+    drain_completed(drain_for_status(
+        events,
+        receiver,
+        duration,
+        stdout_prefix,
+        heartbeat,
+    ))
 }
 
 fn drain_for_status<W: Write>(
@@ -423,15 +516,29 @@ fn drain_for_status<W: Write>(
     receiver: &mpsc::Receiver<drain::DrainEvent>,
     duration: Duration,
     stdout_prefix: &mut StdoutPrefixAccumulator,
+    heartbeat: &mut LaunchHeartbeatPacer,
 ) -> DrainStatus {
     let started = Instant::now();
     while started.elapsed() < duration {
-        let remaining = duration.saturating_sub(started.elapsed());
-        if drain_completed(drain_once(events, receiver, remaining, stdout_prefix)) {
+        let timeout = drain_for_poll_timeout(started, duration);
+        if drain_completed(drain_once(
+            events,
+            receiver,
+            timeout,
+            stdout_prefix,
+            heartbeat,
+        )) {
             return DrainStatus::Disconnected;
         }
     }
     DrainStatus::Open
+}
+
+// declared_role: mapper
+fn drain_for_poll_timeout(started: Instant, duration: Duration) -> Duration {
+    duration
+        .saturating_sub(started.elapsed())
+        .min(DRAIN_POLL_INTERVAL)
 }
 
 fn drain_once<W: Write>(
@@ -439,11 +546,14 @@ fn drain_once<W: Write>(
     receiver: &mpsc::Receiver<drain::DrainEvent>,
     timeout: Duration,
     stdout_prefix: &mut StdoutPrefixAccumulator,
+    heartbeat: &mut LaunchHeartbeatPacer,
 ) -> DrainStatus {
-    match receive_drain_event(receiver, timeout) {
-        Ok(event) => drain_received_event(events, event, stdout_prefix),
+    let status = match receive_drain_event(receiver, timeout) {
+        Ok(event) => drain_received_event(events, event, stdout_prefix, heartbeat),
         Err(error) => drain_error_status(error),
-    }
+    };
+    emit_drain_heartbeat_if_due(events, heartbeat);
+    status
 }
 
 fn receive_drain_event(
@@ -457,9 +567,23 @@ fn drain_received_event<W: Write>(
     events: &mut events::EventWriter<W>,
     event: drain::DrainEvent,
     stdout_prefix: &mut StdoutPrefixAccumulator,
+    heartbeat: &mut LaunchHeartbeatPacer,
 ) -> DrainStatus {
-    emit_drain_event(events, event, stdout_prefix);
+    if emit_drain_event(events, event, stdout_prefix) {
+        heartbeat.note_event(Instant::now());
+    }
     DrainStatus::Open
+}
+
+// declared_role: orchestration
+fn emit_drain_heartbeat_if_due<W: Write>(
+    events: &mut events::EventWriter<W>,
+    heartbeat: &mut LaunchHeartbeatPacer,
+) {
+    let now = Instant::now();
+    if heartbeat.due(now) && events.heartbeat(LAUNCH_HEARTBEAT_DETAIL).is_ok() {
+        heartbeat.note_event(now);
+    }
 }
 
 fn drain_error_status(error: mpsc::RecvTimeoutError) -> DrainStatus {
@@ -478,10 +602,10 @@ fn emit_drain_event<W: Write>(
     events: &mut events::EventWriter<W>,
     event: drain::DrainEvent,
     stdout_prefix: &mut StdoutPrefixAccumulator,
-) {
+) -> bool {
     let (channel, bytes) = drain_event_data(event);
     record_stdout_channel_prefix(stdout_prefix, channel, &bytes);
-    emit_stream_data(events, channel, &bytes);
+    emit_stream_data(events, channel, &bytes).is_ok()
 }
 
 // declared_role: filter
@@ -503,8 +627,8 @@ fn emit_stream_data<W: Write>(
     events: &mut events::EventWriter<W>,
     channel: &'static str,
     bytes: &[u8],
-) {
-    let _ = events.data(channel, bytes);
+) -> io::Result<()> {
+    events.data(channel, bytes)
 }
 
 // declared_role: orchestration
