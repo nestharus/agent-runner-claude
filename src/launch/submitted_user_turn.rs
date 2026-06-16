@@ -54,6 +54,10 @@ pub fn marker_value(confirmation: &ResumeConfirmation) -> Value {
 
 // declared_role: accessor
 fn known_provider_session_id(params: &Value) -> Option<&str> {
+    match super::params::known_provider_session_start_mode(params) {
+        Some("create" | "resume") => {}
+        _ => return None,
+    }
     super::params::known_provider_session_id(params)
 }
 

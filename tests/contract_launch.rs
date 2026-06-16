@@ -500,6 +500,29 @@ fn launch_resume_injects_resume_arg_before_prompt_arg() {
 }
 
 #[test]
+fn launch_create_injects_session_id_arg_before_prompt_arg() {
+    let roots = temp_roots("launch-create-argv-insert");
+    let fixture = argv_capture_stdout_session_fixture(&roots);
+    let prompt = "create prompt payload";
+
+    let request = prompt_arg_request_with_session(
+        &roots,
+        &fixture.script,
+        &["-p", prompt],
+        prompt,
+        Some(("known-create-session-123", Some("create"))),
+    );
+    let output = invoke("launch", &request);
+    let events = assert_valid_launch_invocation(output);
+
+    assert_exit_provider_session_id(&events, "known-create-session-123");
+    assert_eq!(
+        captured_argv(&fixture.argv_path),
+        ["-p", "--session-id", "known-create-session-123", prompt]
+    );
+}
+
+#[test]
 fn launch_fresh_does_not_inject_resume_arg() {
     let roots = temp_roots("launch-fresh-no-resume-argv");
     let fixture = argv_capture_stdout_session_fixture(&roots);
@@ -521,7 +544,14 @@ fn launch_resume_replaces_existing_resume_arg_without_duplicate() {
     let request = prompt_arg_request(
         &roots,
         &fixture.script,
-        &["-p", "--resume", "stale-session", prompt],
+        &[
+            "-p",
+            "--resume",
+            "stale-session",
+            "--resume",
+            "duplicate-session",
+            prompt,
+        ],
         prompt,
         Some("known-resume-session-abc"),
     );
@@ -533,6 +563,122 @@ fn launch_resume_replaces_existing_resume_arg_without_duplicate() {
         captured_argv(&fixture.argv_path),
         ["-p", "--resume", "known-resume-session-abc", prompt]
     );
+}
+
+#[test]
+fn launch_create_replaces_existing_session_id_arg_without_duplicate() {
+    let roots = temp_roots("launch-create-argv-replace");
+    let fixture = argv_capture_stdout_session_fixture(&roots);
+    let prompt = "create replacement prompt payload";
+
+    let request = prompt_arg_request_with_session(
+        &roots,
+        &fixture.script,
+        &[
+            "-p",
+            "--session-id",
+            "stale-session",
+            "--session-id",
+            "duplicate-session",
+            prompt,
+        ],
+        prompt,
+        Some(("known-create-session-abc", Some("create"))),
+    );
+    let output = invoke("launch", &request);
+    let events = assert_valid_launch_invocation(output);
+
+    assert_exit_provider_session_id(&events, "known-create-session-abc");
+    assert_eq!(
+        captured_argv(&fixture.argv_path),
+        ["-p", "--session-id", "known-create-session-abc", prompt]
+    );
+}
+
+#[test]
+fn launch_resume_removes_existing_session_id_arg_when_switching_modes() {
+    let roots = temp_roots("launch-resume-removes-session-id");
+    let fixture = argv_capture_stdout_session_fixture(&roots);
+    let prompt = "resume switch prompt payload";
+
+    let request = prompt_arg_request(
+        &roots,
+        &fixture.script,
+        &["-p", "--session-id", "stale-session", prompt],
+        prompt,
+        Some("known-resume-session-switch"),
+    );
+    let output = invoke("launch", &request);
+    let events = assert_valid_launch_invocation(output);
+
+    assert_exit_provider_session_id(&events, "known-resume-session-switch");
+    assert_eq!(
+        captured_argv(&fixture.argv_path),
+        ["-p", "--resume", "known-resume-session-switch", prompt]
+    );
+}
+
+#[test]
+fn launch_create_removes_existing_resume_arg_when_switching_modes() {
+    let roots = temp_roots("launch-create-removes-resume");
+    let fixture = argv_capture_stdout_session_fixture(&roots);
+    let prompt = "create switch prompt payload";
+
+    let request = prompt_arg_request_with_session(
+        &roots,
+        &fixture.script,
+        &["-p", "--resume", "stale-session", prompt],
+        prompt,
+        Some(("known-create-session-switch", Some("create"))),
+    );
+    let output = invoke("launch", &request);
+    let events = assert_valid_launch_invocation(output);
+
+    assert_exit_provider_session_id(&events, "known-create-session-switch");
+    assert_eq!(
+        captured_argv(&fixture.argv_path),
+        ["-p", "--session-id", "known-create-session-switch", prompt]
+    );
+}
+
+#[test]
+fn launch_known_session_without_start_mode_injects_no_session_flag_and_uses_stdout_session() {
+    let roots = temp_roots("launch-session-missing-start-mode");
+    let fixture = argv_capture_stdout_session_fixture(&roots);
+    let prompt = "missing start mode prompt payload";
+
+    let request = prompt_arg_request_with_session(
+        &roots,
+        &fixture.script,
+        &["-p", prompt],
+        prompt,
+        Some(("known-session-without-mode", None)),
+    );
+    let output = invoke("launch", &request);
+    let events = assert_valid_launch_invocation(output);
+
+    assert_exit_provider_session_id(&events, "child-reported-session");
+    assert_eq!(captured_argv(&fixture.argv_path), ["-p", prompt]);
+}
+
+#[test]
+fn launch_known_session_with_unknown_start_mode_injects_no_session_flag_and_uses_stdout_session() {
+    let roots = temp_roots("launch-session-unknown-start-mode");
+    let fixture = argv_capture_stdout_session_fixture(&roots);
+    let prompt = "unknown start mode prompt payload";
+
+    let request = prompt_arg_request_with_session(
+        &roots,
+        &fixture.script,
+        &["-p", prompt],
+        prompt,
+        Some(("known-session-unknown-mode", Some("bogus"))),
+    );
+    let output = invoke("launch", &request);
+    let events = assert_valid_launch_invocation(output);
+
+    assert_exit_provider_session_id(&events, "child-reported-session");
+    assert_eq!(captured_argv(&fixture.argv_path), ["-p", prompt]);
 }
 
 #[test]
@@ -619,7 +765,10 @@ fn resume_stdin_request(
 ) -> Value {
     let mut extra = json!({ "stdin": { "encoding": "utf8", "data": prompt } });
     if let Some(session_id) = session_id {
-        extra["session"] = json!({ "known_provider_session_id": session_id });
+        extra["session"] = json!({
+            "known_provider_session_id": session_id,
+            "start_mode": "resume"
+        });
     }
     launch_request(roots, vec![path_string(script)], extra)
 }
@@ -631,6 +780,22 @@ fn prompt_arg_request(
     prompt: &str,
     session_id: Option<&str>,
 ) -> Value {
+    prompt_arg_request_with_session(
+        roots,
+        script,
+        child_args,
+        prompt,
+        session_id.map(|session_id| (session_id, Some("resume"))),
+    )
+}
+
+fn prompt_arg_request_with_session(
+    roots: &support::fixtures::TempRoots,
+    script: &std::path::Path,
+    child_args: &[&str],
+    prompt: &str,
+    session: Option<(&str, Option<&str>)>,
+) -> Value {
     let mut argv = vec![path_string(script)];
     argv.extend(child_args.iter().map(|arg| (*arg).to_string()));
     let mut extra = json!({
@@ -640,8 +805,11 @@ fn prompt_arg_request(
             "inputs": { "prompt": prompt, "named": {} }
         }
     });
-    if let Some(session_id) = session_id {
+    if let Some((session_id, start_mode)) = session {
         extra["session"] = json!({ "known_provider_session_id": session_id });
+        if let Some(start_mode) = start_mode {
+            extra["session"]["start_mode"] = json!(start_mode);
+        }
     }
     launch_request(roots, argv, extra)
 }

@@ -14,10 +14,22 @@
         "working_directory": { "type": "string", "minLength": 1 },
         "env": { "$ref": "common.schema.json#/$defs/StringMap" },
         "stdin": { "$ref": "common.schema.json#/$defs/BytePayload" },
-        "session": { "type": "object", "additionalProperties": true }
+        "session": { "$ref": "#/$defs/LaunchSession" }
       },
       "required": ["settings_id", "mode", "model", "argv", "working_directory"],
       "additionalProperties": false
+    },
+    "LaunchSession": {
+      "type": "object",
+      "properties": {
+        "known_provider_session_id": { "type": "string", "minLength": 1 },
+        "start_mode": { "enum": ["create", "resume"] }
+      },
+      "dependentRequired": {
+        "known_provider_session_id": ["start_mode"],
+        "start_mode": ["known_provider_session_id"]
+      },
+      "additionalProperties": true
     },
     "LaunchRequest": {
       "allOf": [

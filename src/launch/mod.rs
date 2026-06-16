@@ -34,6 +34,7 @@ const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const FINAL_DRAIN_GRACE: Duration = Duration::from_millis(100);
 const STDOUT_SESSION_ID_PREFIX_CAP: usize = 256 * 1024;
 const CLAUDE_RESUME_FLAG: &str = "--resume";
+const CLAUDE_SESSION_ID_FLAG: &str = "--session-id";
 
 #[derive(Clone, Copy)]
 enum DrainStatus {
@@ -81,7 +82,7 @@ fn launch(request: &RequestEnvelope) -> Result<Value, ProviderFailure> {
         Ok(argv) => argv,
         Err(message) => stream_pre_spawn_exit(&request.request_id, &message),
     };
-    let argv = resume_argv(params, argv);
+    let argv = session_argv(params, argv);
     let cwd = match params::required_string(params, "working_directory") {
         Ok(cwd) => cwd,
         Err(message) => stream_pre_spawn_exit(&request.request_id, &message),
@@ -151,31 +152,53 @@ fn validate_required_params(params: &Value) -> Result<(), String> {
     Ok(())
 }
 
-fn resume_argv(params: &Value, mut argv: Vec<String>) -> Vec<String> {
+fn session_argv(params: &Value, mut argv: Vec<String>) -> Vec<String> {
     let Some(session_id) = params::known_provider_session_id(params) else {
         return argv;
     };
-    let insert_at = resume_arg_insert_index(params, &argv);
-    upsert_resume_arg(&mut argv, session_id, insert_at);
+    let Some(flag) = claude_session_flag(params) else {
+        // Defensive fallback for malformed callers: never guess create vs resume.
+        // With no flag, Claude can self-select and stdout session capture remains authoritative.
+        return argv;
+    };
+    remove_session_args(&mut argv, opposite_session_flag(flag));
+    let insert_at = session_arg_insert_index(params, &argv);
+    upsert_session_arg(&mut argv, flag, session_id, insert_at);
     argv
 }
 
-fn resume_arg_insert_index(params: &Value, argv: &[String]) -> usize {
+fn claude_session_flag(params: &Value) -> Option<&'static str> {
+    match params::known_provider_session_start_mode(params) {
+        Some("create") => Some(CLAUDE_SESSION_ID_FLAG),
+        Some("resume") => Some(CLAUDE_RESUME_FLAG),
+        _ => None,
+    }
+}
+
+fn opposite_session_flag(flag: &str) -> &'static str {
+    match flag {
+        CLAUDE_SESSION_ID_FLAG => CLAUDE_RESUME_FLAG,
+        CLAUDE_RESUME_FLAG => CLAUDE_SESSION_ID_FLAG,
+        _ => unreachable!("known Claude session flag"),
+    }
+}
+
+fn session_arg_insert_index(params: &Value, argv: &[String]) -> usize {
     params::prompt_input(params)
         .and_then(|prompt| argv.iter().position(|arg| arg == prompt))
         .unwrap_or(argv.len())
 }
 
-fn upsert_resume_arg(argv: &mut Vec<String>, session_id: &str, insert_at: usize) {
-    if let Some(index) = argv.iter().position(|arg| arg == CLAUDE_RESUME_FLAG) {
-        set_existing_resume_arg(argv, index, session_id);
-        remove_duplicate_resume_args(argv, index);
+fn upsert_session_arg(argv: &mut Vec<String>, flag: &str, session_id: &str, insert_at: usize) {
+    if let Some(index) = argv.iter().position(|arg| arg == flag) {
+        set_existing_session_arg(argv, index, session_id);
+        remove_duplicate_session_args(argv, flag, index);
     } else {
-        insert_resume_arg(argv, insert_at, session_id);
+        insert_session_arg(argv, flag, insert_at, session_id);
     }
 }
 
-fn set_existing_resume_arg(argv: &mut Vec<String>, index: usize, session_id: &str) {
+fn set_existing_session_arg(argv: &mut Vec<String>, index: usize, session_id: &str) {
     if index + 1 < argv.len() {
         argv[index + 1] = session_id.to_string();
     } else {
@@ -183,10 +206,10 @@ fn set_existing_resume_arg(argv: &mut Vec<String>, index: usize, session_id: &st
     }
 }
 
-fn remove_duplicate_resume_args(argv: &mut Vec<String>, keep_index: usize) {
+fn remove_duplicate_session_args(argv: &mut Vec<String>, flag: &str, keep_index: usize) {
     let mut index = keep_index + 2;
     while index < argv.len() {
-        if argv[index] == CLAUDE_RESUME_FLAG {
+        if argv[index] == flag {
             argv.remove(index);
             if index < argv.len() {
                 argv.remove(index);
@@ -197,8 +220,22 @@ fn remove_duplicate_resume_args(argv: &mut Vec<String>, keep_index: usize) {
     }
 }
 
-fn insert_resume_arg(argv: &mut Vec<String>, insert_at: usize, session_id: &str) {
-    argv.insert(insert_at, CLAUDE_RESUME_FLAG.to_string());
+fn remove_session_args(argv: &mut Vec<String>, flag: &str) {
+    let mut index = 0;
+    while index < argv.len() {
+        if argv[index] == flag {
+            argv.remove(index);
+            if index < argv.len() {
+                argv.remove(index);
+            }
+        } else {
+            index += 1;
+        }
+    }
+}
+
+fn insert_session_arg(argv: &mut Vec<String>, flag: &str, insert_at: usize, session_id: &str) {
+    argv.insert(insert_at, flag.to_string());
     argv.insert(insert_at + 1, session_id.to_string());
 }
 

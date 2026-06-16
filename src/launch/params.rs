@@ -28,6 +28,10 @@ pub fn known_provider_session_id(params: &Value) -> Option<&str> {
     nonblank_optional_text(raw_known_provider_session_id(params))
 }
 
+pub fn known_provider_session_start_mode(params: &Value) -> Option<&str> {
+    nonblank_optional_text(raw_known_provider_session_start_mode(params))
+}
+
 pub fn prompt_input(params: &Value) -> Option<&str> {
     params
         .get("model")
@@ -44,6 +48,13 @@ fn raw_known_provider_session_id(params: &Value) -> Option<&str> {
     params
         .get("session")
         .and_then(|session| session.get("known_provider_session_id"))
+        .and_then(Value::as_str)
+}
+
+fn raw_known_provider_session_start_mode(params: &Value) -> Option<&str> {
+    params
+        .get("session")
+        .and_then(|session| session.get("start_mode"))
         .and_then(Value::as_str)
 }
 
