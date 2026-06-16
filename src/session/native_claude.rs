@@ -20,7 +20,10 @@ pub struct NativeTurn {
     pub session_id: String,
     pub role: String,
     pub body: Value,
-    pub timestamp: Option<String>,
+    pub timestamp: String,
+    pub parent_turn_id: Option<String>,
+    pub is_sidechain: Option<bool>,
+    pub is_compaction_boundary: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -92,7 +95,10 @@ pub fn turn_from_record(record: &NativeRecord, session_id: &str) -> NativeTurn {
         session_id: session_id.to_string(),
         role: turn_role(record),
         body: normalized_body(&record.value),
-        timestamp: record_timestamp(record),
+        timestamp: host_turn_timestamp(record),
+        parent_turn_id: parent_turn_id(&record.value),
+        is_sidechain: optional_bool(&record.value, "isSidechain"),
+        is_compaction_boundary: optional_bool(&record.value, "isCompactSummary"),
     }
 }
 
@@ -190,6 +196,25 @@ fn record_timestamp(record: &NativeRecord) -> Option<String> {
         .get("timestamp")
         .and_then(Value::as_str)
         .map(str::to_string)
+}
+
+fn host_turn_timestamp(record: &NativeRecord) -> String {
+    record_timestamp(record)
+        .filter(|timestamp| chrono::DateTime::parse_from_rfc3339(timestamp).is_ok())
+        // Deterministic fallback: host requires parseable RFC3339 even for malformed legacy lines.
+        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string())
+}
+
+fn parent_turn_id(value: &Value) -> Option<String> {
+    value
+        .get("parentUuid")
+        .and_then(Value::as_str)
+        .filter(|uuid| !uuid.is_empty())
+        .map(|uuid| format!("uuid:{uuid}"))
+}
+
+fn optional_bool(value: &Value, key: &str) -> Option<bool> {
+    value.get(key).and_then(Value::as_bool)
 }
 
 fn canonical_turn_from_record(record: &NativeRecord, timestamp: String) -> CanonicalRecord {
