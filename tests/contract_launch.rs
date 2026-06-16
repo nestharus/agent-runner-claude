@@ -352,6 +352,11 @@ struct DescendantStdioFixture {
     pid_file: PathBuf,
 }
 
+struct ArgvCaptureFixture {
+    script: PathBuf,
+    argv_path: PathBuf,
+}
+
 fn descendant_stdio_fixture(roots: &support::fixtures::TempRoots) -> DescendantStdioFixture {
     let fixture = descendant_stdio_fixture_record(roots);
     install_descendant_stdio_fixture(&fixture);
@@ -365,6 +370,18 @@ fn descendant_stdio_fixture_record(roots: &support::fixtures::TempRoots) -> Desc
     }
 }
 
+fn argv_capture_stdout_session_fixture(roots: &support::fixtures::TempRoots) -> ArgvCaptureFixture {
+    let fixture = ArgvCaptureFixture {
+        script: roots.root.join("argv-capture-child.sh"),
+        argv_path: roots.root.join("argv.txt"),
+    };
+    write_executable(
+        &fixture.script,
+        &argv_capture_stdout_session_script(&fixture.argv_path),
+    );
+    fixture
+}
+
 fn install_descendant_stdio_fixture(fixture: &DescendantStdioFixture) {
     write_executable(&fixture.script, &descendant_stdio_script(&fixture.pid_file));
 }
@@ -373,6 +390,15 @@ fn descendant_stdio_script(pid_file: &std::path::Path) -> String {
     format!(
         "#!/bin/sh\n(sleep 30) &\necho $! > '{}'\nexit 0\n",
         pid_file.display()
+    )
+}
+
+fn argv_capture_stdout_session_script(argv_path: &std::path::Path) -> String {
+    format!(
+        "#!/bin/sh\n: > '{}'\nfor arg in \"$@\"; do printf '%s\n' \"$arg\" >> '{}'; done\n{}exit 0\n",
+        argv_path.display(),
+        argv_path.display(),
+        stdout_session_line_script("child-reported-session")
     )
 }
 
@@ -448,6 +474,65 @@ fn launch_resume_exit_reports_known_provider_session_id() {
     let output = invoke("launch", &request);
     let events = assert_valid_launch_invocation(output);
     assert_exit_provider_session_id(&events, "known-resume-session-456");
+}
+
+#[test]
+fn launch_resume_injects_resume_arg_before_prompt_arg() {
+    let roots = temp_roots("launch-resume-argv-insert");
+    let fixture = argv_capture_stdout_session_fixture(&roots);
+    let prompt = "resume prompt payload";
+
+    let request = prompt_arg_request(
+        &roots,
+        &fixture.script,
+        &["-p", prompt],
+        prompt,
+        Some("known-resume-session-789"),
+    );
+    let output = invoke("launch", &request);
+    let events = assert_valid_launch_invocation(output);
+
+    assert_exit_provider_session_id(&events, "known-resume-session-789");
+    assert_eq!(
+        captured_argv(&fixture.argv_path),
+        ["-p", "--resume", "known-resume-session-789", prompt]
+    );
+}
+
+#[test]
+fn launch_fresh_does_not_inject_resume_arg() {
+    let roots = temp_roots("launch-fresh-no-resume-argv");
+    let fixture = argv_capture_stdout_session_fixture(&roots);
+    let prompt = "fresh prompt payload";
+
+    let request = prompt_arg_request(&roots, &fixture.script, &["-p", prompt], prompt, None);
+    let output = invoke("launch", &request);
+    assert_valid_launch_invocation(output);
+
+    assert_eq!(captured_argv(&fixture.argv_path), ["-p", prompt]);
+}
+
+#[test]
+fn launch_resume_replaces_existing_resume_arg_without_duplicate() {
+    let roots = temp_roots("launch-resume-argv-replace");
+    let fixture = argv_capture_stdout_session_fixture(&roots);
+    let prompt = "replacement prompt payload";
+
+    let request = prompt_arg_request(
+        &roots,
+        &fixture.script,
+        &["-p", "--resume", "stale-session", prompt],
+        prompt,
+        Some("known-resume-session-abc"),
+    );
+    let output = invoke("launch", &request);
+    let events = assert_valid_launch_invocation(output);
+
+    assert_exit_provider_session_id(&events, "known-resume-session-abc");
+    assert_eq!(
+        captured_argv(&fixture.argv_path),
+        ["-p", "--resume", "known-resume-session-abc", prompt]
+    );
 }
 
 #[test]
@@ -537,6 +622,28 @@ fn resume_stdin_request(
         extra["session"] = json!({ "known_provider_session_id": session_id });
     }
     launch_request(roots, vec![path_string(script)], extra)
+}
+
+fn prompt_arg_request(
+    roots: &support::fixtures::TempRoots,
+    script: &std::path::Path,
+    child_args: &[&str],
+    prompt: &str,
+    session_id: Option<&str>,
+) -> Value {
+    let mut argv = vec![path_string(script)];
+    argv.extend(child_args.iter().map(|arg| (*arg).to_string()));
+    let mut extra = json!({
+        "model": {
+            "name": "claude-sonnet",
+            "provider_args": [],
+            "inputs": { "prompt": prompt, "named": {} }
+        }
+    });
+    if let Some(session_id) = session_id {
+        extra["session"] = json!({ "known_provider_session_id": session_id });
+    }
+    launch_request(roots, argv, extra)
 }
 
 // declared_role: validator
@@ -825,6 +932,10 @@ fn captured_bytes(path: &std::path::Path) -> Vec<u8> {
 
 fn captured_text(path: &std::path::Path) -> String {
     fs::read_to_string(path).expect("captured text")
+}
+
+fn captured_argv(path: &std::path::Path) -> Vec<String> {
+    captured_text(path).lines().map(str::to_string).collect()
 }
 
 #[test]

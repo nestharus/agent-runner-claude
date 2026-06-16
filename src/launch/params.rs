@@ -24,8 +24,31 @@ pub fn argv(params: &Value) -> Result<Vec<String>, String> {
     Ok(owned_strings(&strings))
 }
 
+pub fn known_provider_session_id(params: &Value) -> Option<&str> {
+    nonblank_optional_text(raw_known_provider_session_id(params))
+}
+
+pub fn prompt_input(params: &Value) -> Option<&str> {
+    params
+        .get("model")
+        .and_then(|model| model.get("inputs"))
+        .and_then(|inputs| inputs.get("prompt"))
+        .and_then(Value::as_str)
+}
+
 fn string_field<'a>(params: &'a Value, field: &str) -> Option<&'a str> {
     params.get(field).and_then(Value::as_str)
+}
+
+fn raw_known_provider_session_id(params: &Value) -> Option<&str> {
+    params
+        .get("session")
+        .and_then(|session| session.get("known_provider_session_id"))
+        .and_then(Value::as_str)
+}
+
+fn nonblank_optional_text(value: Option<&str>) -> Option<&str> {
+    value.filter(|text| !text.trim().is_empty())
 }
 
 fn require_non_empty_string<'a>(value: Option<&'a str>, field: &str) -> Result<&'a str, String> {

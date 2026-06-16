@@ -33,6 +33,7 @@ use crate::envelope::error::{ErrorCategory, ProviderFailure};
 const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const FINAL_DRAIN_GRACE: Duration = Duration::from_millis(100);
 const STDOUT_SESSION_ID_PREFIX_CAP: usize = 256 * 1024;
+const CLAUDE_RESUME_FLAG: &str = "--resume";
 
 #[derive(Clone, Copy)]
 enum DrainStatus {
@@ -80,6 +81,7 @@ fn launch(request: &RequestEnvelope) -> Result<Value, ProviderFailure> {
         Ok(argv) => argv,
         Err(message) => stream_pre_spawn_exit(&request.request_id, &message),
     };
+    let argv = resume_argv(params, argv);
     let cwd = match params::required_string(params, "working_directory") {
         Ok(cwd) => cwd,
         Err(message) => stream_pre_spawn_exit(&request.request_id, &message),
@@ -147,6 +149,57 @@ fn validate_required_params(params: &Value) -> Result<(), String> {
     }
     let _ = params::argv(params)?;
     Ok(())
+}
+
+fn resume_argv(params: &Value, mut argv: Vec<String>) -> Vec<String> {
+    let Some(session_id) = params::known_provider_session_id(params) else {
+        return argv;
+    };
+    let insert_at = resume_arg_insert_index(params, &argv);
+    upsert_resume_arg(&mut argv, session_id, insert_at);
+    argv
+}
+
+fn resume_arg_insert_index(params: &Value, argv: &[String]) -> usize {
+    params::prompt_input(params)
+        .and_then(|prompt| argv.iter().position(|arg| arg == prompt))
+        .unwrap_or(argv.len())
+}
+
+fn upsert_resume_arg(argv: &mut Vec<String>, session_id: &str, insert_at: usize) {
+    if let Some(index) = argv.iter().position(|arg| arg == CLAUDE_RESUME_FLAG) {
+        set_existing_resume_arg(argv, index, session_id);
+        remove_duplicate_resume_args(argv, index);
+    } else {
+        insert_resume_arg(argv, insert_at, session_id);
+    }
+}
+
+fn set_existing_resume_arg(argv: &mut Vec<String>, index: usize, session_id: &str) {
+    if index + 1 < argv.len() {
+        argv[index + 1] = session_id.to_string();
+    } else {
+        argv.insert(index + 1, session_id.to_string());
+    }
+}
+
+fn remove_duplicate_resume_args(argv: &mut Vec<String>, keep_index: usize) {
+    let mut index = keep_index + 2;
+    while index < argv.len() {
+        if argv[index] == CLAUDE_RESUME_FLAG {
+            argv.remove(index);
+            if index < argv.len() {
+                argv.remove(index);
+            }
+        } else {
+            index += 1;
+        }
+    }
+}
+
+fn insert_resume_arg(argv: &mut Vec<String>, insert_at: usize, session_id: &str) {
+    argv.insert(insert_at, CLAUDE_RESUME_FLAG.to_string());
+    argv.insert(insert_at + 1, session_id.to_string());
 }
 
 fn launch_env(
@@ -431,7 +484,8 @@ fn emit_terminal_exit<W: Write>(
 
 // declared_role: formatter
 fn exit_session_object(provider_session_id: Option<String>) -> Option<Value> {
-    provider_session_id.map(|provider_session_id| json!({ "provider_session_id": provider_session_id }))
+    provider_session_id
+        .map(|provider_session_id| json!({ "provider_session_id": provider_session_id }))
 }
 
 // declared_role: mapper

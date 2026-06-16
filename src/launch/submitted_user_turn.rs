@@ -54,15 +54,7 @@ pub fn marker_value(confirmation: &ResumeConfirmation) -> Value {
 
 // declared_role: accessor
 fn known_provider_session_id(params: &Value) -> Option<&str> {
-    nonblank_optional_text(raw_known_provider_session_id(params))
-}
-
-// declared_role: accessor
-fn raw_known_provider_session_id(params: &Value) -> Option<&str> {
-    params
-        .get("session")
-        .and_then(|session| session.get("known_provider_session_id"))
-        .and_then(Value::as_str)
+    super::params::known_provider_session_id(params)
 }
 
 // declared_role: mapper
@@ -105,11 +97,7 @@ fn payload_utf8_text(bytes: &[u8]) -> Option<&str> {
 
 // declared_role: accessor
 fn prompt_input(params: &Value) -> Option<&str> {
-    params
-        .get("model")
-        .and_then(|model| model.get("inputs"))
-        .and_then(|inputs| inputs.get("prompt"))
-        .and_then(Value::as_str)
+    super::params::prompt_input(params)
 }
 
 // declared_role: mapper
