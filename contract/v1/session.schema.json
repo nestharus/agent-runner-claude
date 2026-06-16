@@ -49,12 +49,27 @@
       "properties": {
         "turns": {
           "type": "array",
-          "items": { "type": "object", "additionalProperties": true }
+          "items": { "$ref": "#/$defs/SessionTurn" }
         },
         "turn_count": { "type": "integer", "minimum": 0 },
         "complete": { "type": "boolean" }
       },
       "required": ["turns", "turn_count", "complete"],
+      "additionalProperties": false
+    },
+    "SessionTurn": {
+      "type": "object",
+      "properties": {
+        "turn_id": { "type": "string", "minLength": 1 },
+        "session_id": { "type": "string", "minLength": 1 },
+        "role": { "type": "string", "minLength": 1 },
+        "timestamp": { "type": "string", "minLength": 1, "format": "date-time" },
+        "parent_turn_id": { "type": "string", "minLength": 1 },
+        "is_sidechain": { "type": "boolean" },
+        "is_compaction_boundary": { "type": "boolean" },
+        "body": true
+      },
+      "required": ["turn_id", "session_id", "role", "timestamp"],
       "additionalProperties": false
     },
     "SessionReadTurnsResponse": {

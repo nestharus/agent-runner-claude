@@ -8,7 +8,7 @@
 //       - src/session/storage.rs transcript locate/read seam
 //       - src/session/native_claude.rs native transcript parse/turn projection seam
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use crate::envelope::decode::RequestEnvelope;
 use crate::envelope::error::ProviderFailure;
@@ -153,12 +153,25 @@ fn turn_values(turns: Vec<NativeTurn>) -> Vec<Value> {
 }
 
 fn turn_value(turn: NativeTurn) -> Value {
-    json!({
-        "id": turn.id,
-        "session_id": turn.session_id,
-        "role": turn.role,
-        "body": turn.body,
-    })
+    let mut value = Map::new();
+    value.insert("turn_id".to_string(), json!(turn.id));
+    value.insert("session_id".to_string(), json!(turn.session_id));
+    value.insert("role".to_string(), json!(turn.role));
+    value.insert("timestamp".to_string(), json!(turn.timestamp));
+    if let Some(parent_turn_id) = turn.parent_turn_id {
+        value.insert("parent_turn_id".to_string(), json!(parent_turn_id));
+    }
+    if let Some(is_sidechain) = turn.is_sidechain {
+        value.insert("is_sidechain".to_string(), json!(is_sidechain));
+    }
+    if let Some(is_compaction_boundary) = turn.is_compaction_boundary {
+        value.insert(
+            "is_compaction_boundary".to_string(),
+            json!(is_compaction_boundary),
+        );
+    }
+    value.insert("body".to_string(), turn.body);
+    Value::Object(value)
 }
 
 fn read_turns_response(turns: Vec<Value>, complete: bool) -> Value {
