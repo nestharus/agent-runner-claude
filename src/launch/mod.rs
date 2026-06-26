@@ -112,6 +112,9 @@ fn launch(request: &RequestEnvelope) -> Result<Value, ProviderFailure> {
         Err(message) => stream_pre_spawn_exit(&request.request_id, &message),
     };
     let argv = session_argv(params, argv);
+    if let Err(failure) = bound_resume_transcript(request, params) {
+        stream_pre_spawn_exit(&request.request_id, &failure.message);
+    }
     let cwd = match params::required_string(params, "working_directory") {
         Ok(cwd) => cwd,
         Err(message) => stream_pre_spawn_exit(&request.request_id, &message),
@@ -194,6 +197,19 @@ fn session_argv(params: &Value, mut argv: Vec<String>) -> Vec<String> {
     let insert_at = session_arg_insert_index(params, &argv);
     upsert_session_arg(&mut argv, flag, session_id, insert_at);
     argv
+}
+
+fn bound_resume_transcript(
+    request: &RequestEnvelope,
+    params: &Value,
+) -> Result<(), ProviderFailure> {
+    if params::known_provider_session_start_mode(params) != Some("resume") {
+        return Ok(());
+    }
+    let Some(session_id) = params::known_provider_session_id(params) else {
+        return Ok(());
+    };
+    crate::session::resume_bound::bound_latest_compaction_for_resume(request, params, session_id)
 }
 
 fn claude_session_flag(params: &Value) -> Option<&'static str> {

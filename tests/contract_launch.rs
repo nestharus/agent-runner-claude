@@ -432,6 +432,41 @@ fn argv_capture_stdout_session_script(argv_path: &std::path::Path) -> String {
     )
 }
 
+fn argv_and_transcript_capture_script(
+    argv_path: &std::path::Path,
+    transcript: &std::path::Path,
+    child_seen_transcript: &std::path::Path,
+) -> String {
+    format!(
+        "#!/bin/sh\n: > '{}'\nfor arg in \"$@\"; do printf '%s\n' \"$arg\" >> '{}'; done\ncp '{}' '{}'\n{}exit 0\n",
+        argv_path.display(),
+        argv_path.display(),
+        transcript.display(),
+        child_seen_transcript.display(),
+        stdout_session_line_script("child-reported-session")
+    )
+}
+
+fn jsonl_line(value: Value) -> String {
+    format!("{value}\n")
+}
+
+fn transcript_backups(transcript: &std::path::Path) -> Vec<PathBuf> {
+    let mut backups: Vec<PathBuf> =
+        fs::read_dir(transcript.parent().expect("transcript has parent"))
+            .expect("read transcript parent")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains("oulipoly-full-backup"))
+            })
+            .collect();
+    backups.sort();
+    backups
+}
+
 fn assert_descendant_stdio_output(output: support::invoke::Invocation) {
     assert_eq!(output.code, Some(0));
     assert!(output.stderr.is_empty());
@@ -612,6 +647,81 @@ fn launch_resume_injects_resume_arg_before_prompt_arg() {
     assert_eq!(
         captured_argv(&fixture.argv_path),
         ["-p", "--resume", "known-resume-session-789", prompt]
+    );
+}
+
+#[test]
+fn launch_resume_bounds_transcript_before_spawn_and_preserves_policy_flags() {
+    let roots = temp_roots("launch-resume-bound-transcript-policy-flags");
+    let session_id = "known-resume-session-bound";
+    let transcript = roots
+        .home
+        .join(".claude")
+        .join("projects")
+        .join("-tmp-fixture")
+        .join(format!("{session_id}.jsonl"));
+    fs::create_dir_all(transcript.parent().expect("transcript has parent"))
+        .expect("create transcript parent");
+    let old_turn = jsonl_line(
+        json!({ "sessionId": session_id, "type": "user", "message": { "content": "old pre-compaction history" } }),
+    );
+    let summary = jsonl_line(
+        json!({ "sessionId": session_id, "type": "system", "isCompactSummary": true, "message": { "content": "latest compact summary" } }),
+    );
+    let new_turn = jsonl_line(
+        json!({ "sessionId": session_id, "type": "assistant", "message": { "content": "post-summary turn" } }),
+    );
+    let original = format!("{old_turn}{summary}{new_turn}");
+    let bounded = format!("{summary}{new_turn}");
+    fs::write(&transcript, &original).expect("write full transcript");
+    let argv_path = roots.root.join("argv.txt");
+    let child_seen_transcript = roots.root.join("child-seen-transcript.jsonl");
+    let script = roots.root.join("argv-and-transcript-capture.sh");
+    write_executable(
+        &script,
+        &argv_and_transcript_capture_script(&argv_path, &transcript, &child_seen_transcript),
+    );
+    let prompt = "resume prompt payload";
+
+    let request = prompt_arg_request(
+        &roots,
+        &script,
+        &[
+            "-p",
+            "--append-system-prompt",
+            "Runner guidance",
+            "--disallowed-tools",
+            "Task",
+            prompt,
+        ],
+        prompt,
+        Some(session_id),
+    );
+    let output = invoke("launch", &request);
+    let events = assert_valid_launch_invocation(output);
+
+    assert_exit_provider_session_id(&events, session_id);
+    assert_eq!(fs::read_to_string(&transcript).unwrap(), bounded);
+    assert_eq!(fs::read_to_string(&child_seen_transcript).unwrap(), bounded);
+    let backups = transcript_backups(&transcript);
+    assert_eq!(backups.len(), 1);
+    assert_ne!(
+        backups[0].extension().and_then(|ext| ext.to_str()),
+        Some("jsonl")
+    );
+    assert_eq!(fs::read_to_string(&backups[0]).unwrap(), original);
+    assert_eq!(
+        captured_argv(&argv_path),
+        [
+            "-p",
+            "--append-system-prompt",
+            "Runner guidance",
+            "--disallowed-tools",
+            "Task",
+            "--resume",
+            session_id,
+            prompt,
+        ]
     );
 }
 
