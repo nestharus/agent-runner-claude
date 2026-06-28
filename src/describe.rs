@@ -45,7 +45,8 @@ fn format_description() -> Value {
             "settings": true,
             "setup_brain": true,
             "setup": true,
-            "migration": true
+            "migration": true,
+            "session_enumerate": true
         },
         "concurrency": {
             "process_model": "one_shot_cli",

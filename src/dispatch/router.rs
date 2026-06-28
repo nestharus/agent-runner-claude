@@ -36,6 +36,7 @@ pub fn route_request(
             crate::quota::handle(subcommand, request)
         }
         "session.locate_transcript"
+        | "session.enumerate"
         | "session.read_turns"
         | "session.capture"
         | "session.export"

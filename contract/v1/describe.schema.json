@@ -32,7 +32,8 @@
         "settings": { "type": "boolean" },
         "setup_brain": { "type": "boolean" },
         "setup": { "type": "boolean" },
-        "migration": { "type": "boolean" }
+        "migration": { "type": "boolean" },
+        "session_enumerate": { "type": "boolean" }
       },
       "required": [
         "launch",
@@ -45,7 +46,8 @@
         "settings",
         "setup_brain",
         "setup",
-        "migration"
+        "migration",
+        "session_enumerate"
       ],
       "additionalProperties": false
     },

@@ -47,6 +47,7 @@ fn describe_advertises_claude_identity_contract_and_all_wave1_capabilities() {
         "setup_brain",
         "setup",
         "migration",
+        "session_enumerate",
     ] {
         assert_eq!(
             result["capabilities"][capability], true,

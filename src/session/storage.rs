@@ -24,6 +24,14 @@ pub struct ScanBounds {
     pub max_entries: usize,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct TranscriptScan {
+    pub paths: Vec<PathBuf>,
+    pub truncated_depth: bool,
+    pub truncated_entries: bool,
+    pub skipped_confined_paths: Vec<String>,
+}
+
 impl Default for ScanBounds {
     fn default() -> Self {
         Self {
@@ -121,6 +129,14 @@ pub fn locate_by_session_id(
     locate_outcome(select_matches(scan_matches(&projects, session_id, bounds)?))
 }
 
+pub fn scan_transcript_files(home: &Path, bounds: ScanBounds) -> io::Result<TranscriptScan> {
+    let projects = claude_projects_dir(home);
+    if !projects_exist(&projects) {
+        return Ok(TranscriptScan::default());
+    }
+    scan_project_transcript_paths(&projects, bounds, ScanConfinement::SkipInvalid)
+}
+
 pub fn read_transcript(path: &Path) -> io::Result<String> {
     fs::read_to_string(path)
 }
@@ -130,15 +146,30 @@ fn scan_dir(
     dir: &Path,
     depth: usize,
     bounds: ScanBounds,
-    visited: &mut usize,
+    state: &mut ScanState,
+    confinement: ScanConfinement,
     on_file: &mut impl FnMut(&Path),
 ) -> io::Result<()> {
-    if !validate_scan_bounds(depth, *visited, bounds) {
+    if !validate_scan_bounds(depth, state, bounds) {
         return Ok(());
     }
 
     let entries = sorted_scan_entry_paths(dir)?;
-    scan_entries(root, entries, depth, bounds, visited, on_file)
+    scan_entries(root, entries, depth, bounds, state, confinement, on_file)
+}
+
+#[derive(Debug, Default)]
+struct ScanState {
+    visited: usize,
+    truncated_depth: bool,
+    truncated_entries: bool,
+    skipped_confined_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ScanConfinement {
+    Strict,
+    SkipInvalid,
 }
 
 fn scan_entries(
@@ -146,15 +177,17 @@ fn scan_entries(
     entries: Vec<PathBuf>,
     depth: usize,
     bounds: ScanBounds,
-    visited: &mut usize,
+    state: &mut ScanState,
+    confinement: ScanConfinement,
     on_file: &mut impl FnMut(&Path),
 ) -> io::Result<()> {
     for path in entries {
-        if !validate_scan_entry_count(*visited, bounds) {
+        if !validate_scan_entry_count(state.visited, bounds) {
+            state.truncated_entries = true;
             break;
         }
-        count_scan_entry(visited);
-        scan_entry(root, path, depth, bounds, visited, on_file)?;
+        count_scan_entry(state);
+        scan_entry(root, path, depth, bounds, state, confinement, on_file)?;
     }
     Ok(())
 }
@@ -165,8 +198,8 @@ fn sorted_scan_entry_paths(dir: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(entries)
 }
 
-fn count_scan_entry(visited: &mut usize) {
-    *visited += 1;
+fn count_scan_entry(state: &mut ScanState) {
+    state.visited += 1;
 }
 
 fn scan_entry(
@@ -174,18 +207,40 @@ fn scan_entry(
     path: PathBuf,
     depth: usize,
     bounds: ScanBounds,
-    visited: &mut usize,
+    state: &mut ScanState,
+    confinement: ScanConfinement,
     on_file: &mut impl FnMut(&Path),
 ) -> io::Result<()> {
-    let confined = confined_scan_path(root, &path)?;
+    let confined = match confined_scan_path(root, &path) {
+        Ok(path) => path,
+        Err(error) => return handle_scan_confinement_error(path, error, state, confinement),
+    };
     apply_scan_entry_action(
         scan_entry_action(confined),
         root,
         depth,
         bounds,
-        visited,
+        state,
+        confinement,
         on_file,
     )
+}
+
+fn handle_scan_confinement_error(
+    path: PathBuf,
+    error: io::Error,
+    state: &mut ScanState,
+    confinement: ScanConfinement,
+) -> io::Result<()> {
+    match confinement {
+        ScanConfinement::Strict => Err(error),
+        ScanConfinement::SkipInvalid => {
+            state
+                .skipped_confined_paths
+                .push(format!("{} ({error})", path.display()));
+            Ok(())
+        }
+    }
 }
 
 enum ScanEntryAction {
@@ -209,12 +264,13 @@ fn apply_scan_entry_action(
     root: &Path,
     depth: usize,
     bounds: ScanBounds,
-    visited: &mut usize,
+    state: &mut ScanState,
+    confinement: ScanConfinement,
     on_file: &mut impl FnMut(&Path),
 ) -> io::Result<()> {
     match action {
         ScanEntryAction::Recurse(path) => {
-            scan_dir(root, &path, depth + 1, bounds, visited, on_file)
+            scan_dir(root, &path, depth + 1, bounds, state, confinement, on_file)
         }
         ScanEntryAction::Visit(path) => {
             on_file(&path);
@@ -224,8 +280,16 @@ fn apply_scan_entry_action(
     }
 }
 
-fn validate_scan_bounds(depth: usize, visited: usize, bounds: ScanBounds) -> bool {
-    depth <= bounds.max_depth && validate_scan_entry_count(visited, bounds)
+fn validate_scan_bounds(depth: usize, state: &mut ScanState, bounds: ScanBounds) -> bool {
+    if depth > bounds.max_depth {
+        state.truncated_depth = true;
+        return false;
+    }
+    if !validate_scan_entry_count(state.visited, bounds) {
+        state.truncated_entries = true;
+        return false;
+    }
+    true
 }
 
 fn validate_scan_entry_count(visited: usize, bounds: ScanBounds) -> bool {
@@ -289,18 +353,39 @@ fn scan_matches(
     session_id: &str,
     bounds: ScanBounds,
 ) -> io::Result<TranscriptMatches> {
-    let paths = scan_transcript_paths(projects, bounds)?;
+    let paths = scan_project_transcript_paths(projects, bounds, ScanConfinement::Strict)?.paths;
     let candidates = read_transcript_candidates(paths);
     Ok(transcript_matches(&candidates, session_id))
 }
 
-fn scan_transcript_paths(projects: &Path, bounds: ScanBounds) -> io::Result<Vec<PathBuf>> {
-    let mut visited = 0usize;
+fn scan_project_transcript_paths(
+    projects: &Path,
+    bounds: ScanBounds,
+    confinement: ScanConfinement,
+) -> io::Result<TranscriptScan> {
+    let mut state = ScanState::default();
     let mut paths = Vec::new();
-    scan_dir(projects, projects, 0, bounds, &mut visited, &mut |path| {
-        paths.push(path.to_path_buf());
-    })?;
-    Ok(paths)
+    scan_dir(
+        projects,
+        projects,
+        0,
+        bounds,
+        &mut state,
+        confinement,
+        &mut |path| {
+            paths.push(path.to_path_buf());
+        },
+    )?;
+    Ok(transcript_scan(paths, state))
+}
+
+fn transcript_scan(paths: Vec<PathBuf>, state: ScanState) -> TranscriptScan {
+    TranscriptScan {
+        paths,
+        truncated_depth: state.truncated_depth,
+        truncated_entries: state.truncated_entries,
+        skipped_confined_paths: state.skipped_confined_paths,
+    }
 }
 
 fn read_transcript_candidates(paths: Vec<PathBuf>) -> Vec<TranscriptCandidate> {
@@ -445,7 +530,7 @@ fn scan_path_permission_denied(error: crate::fs::paths::PathConfinementError) ->
     )
 }
 
-fn require_jsonl_transcript(path: &Path) -> Result<(), TranscriptPathError> {
+pub fn require_jsonl_transcript(path: &Path) -> Result<(), TranscriptPathError> {
     if is_jsonl_path(path) {
         Ok(())
     } else {

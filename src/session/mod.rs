@@ -15,6 +15,7 @@ use crate::envelope::error::ProviderFailure;
 pub mod atomic;
 pub mod canonical;
 pub mod capture;
+pub mod enumerate;
 pub mod export;
 pub mod locate;
 pub mod native_claude;
@@ -28,6 +29,7 @@ pub mod types;
 pub fn handle(subcommand: &str, request: &RequestEnvelope) -> Result<Value, ProviderFailure> {
     match subcommand {
         "session.locate_transcript" => locate::handle(request),
+        "session.enumerate" => enumerate::enumerate_params(request),
         "session.read_turns" => read_turns::handle(request),
         "session.capture" => capture::handle(request),
         "session.export" => export::handle(request),
