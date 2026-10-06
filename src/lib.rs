@@ -13,6 +13,7 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod launch;
+pub mod resident;
 pub use launch::{run_native_effect_gate, NATIVE_EFFECT_GATE_ARG};
 
 pub const CONTRACT: &str = "oulipoly.provider/v1";
@@ -45,9 +46,9 @@ pub struct InvocationOutput {
     pub exit_code: i32,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct RequestEnvelope {
+pub(crate) struct RequestEnvelope {
     contract: String,
     request_id: String,
     #[allow(dead_code)]
@@ -56,9 +57,9 @@ struct RequestEnvelope {
     params: Value,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct HostContext {
+pub(crate) struct HostContext {
     app: String,
     #[allow(dead_code)]
     app_version: Option<String>,
@@ -111,7 +112,7 @@ struct PolicyEvaluateParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct LaunchParams {
+pub(crate) struct LaunchParams {
     #[allow(dead_code)]
     settings_id: String,
     #[allow(dead_code)]
@@ -125,6 +126,9 @@ struct LaunchParams {
     stdin: Option<BytePayload>,
     #[allow(dead_code)]
     session: Option<Value>,
+    /// `oulipoly.launch_output/v1` request; admitted only when selected.
+    #[serde(default)]
+    output_delivery: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -223,7 +227,7 @@ struct BytePayload {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-enum ProcessStatus {
+pub(crate) enum ProcessStatus {
     Exited { code: i32 },
     SignalTerminated { signal: i32 },
     SpawnError { reason: String },
@@ -248,7 +252,7 @@ enum TerminalSignalKind {
 }
 
 #[derive(Debug)]
-struct TerminalSignal {
+pub(crate) struct TerminalSignal {
     kind: TerminalSignalKind,
     evidence: Option<String>,
     observed_at_unix_ms: u64,
@@ -295,7 +299,7 @@ struct ClaudeRestrictions {
 }
 
 #[derive(Debug)]
-struct ProviderFailure {
+pub(crate) struct ProviderFailure {
     request_id: String,
     code: &'static str,
     category: &'static str,
@@ -409,7 +413,12 @@ fn handle_decoded_invocation(
     subcommand: &str,
 ) -> Result<Value, ProviderFailure> {
     match subcommand {
-        "describe" => Ok(success_response(&request.request_id, describe_result())),
+        "describe" => Ok(success_response(
+            &request.request_id,
+            describe_for(request.host.env.as_ref()),
+        )),
+        resident::PREPARE => resident::prepare(&request)
+            .map(|result| success_response(&request.request_id, result)),
         "schema" => schema_response(request),
         "policy.evaluate" => policy_evaluate_response(request),
         "terminal.classify" => terminal_classify_response(request),
@@ -952,7 +961,7 @@ fn decode_launch_params(request: &RequestEnvelope) -> Result<LaunchParams, Provi
     Ok(params)
 }
 
-fn success_response(request_id: &str, result: Value) -> Value {
+pub(crate) fn success_response(request_id: &str, result: Value) -> Value {
     json!({
         "contract": CONTRACT,
         "request_id": request_id,
@@ -2899,7 +2908,7 @@ fn shell_split(command: &str) -> Vec<String> {
     parts
 }
 
-fn byte_payload_bytes(payload: &BytePayload) -> Result<Vec<u8>, String> {
+pub(crate) fn byte_payload_bytes(payload: &BytePayload) -> Result<Vec<u8>, String> {
     match payload.encoding.as_str() {
         "utf8" => Ok(payload.data.as_bytes().to_vec()),
         "base64" => decode_base64(&payload.data),
@@ -2907,7 +2916,7 @@ fn byte_payload_bytes(payload: &BytePayload) -> Result<Vec<u8>, String> {
     }
 }
 
-fn process_status_from_output(status: &std::process::ExitStatus) -> ProcessStatus {
+pub(crate) fn process_status_from_output(status: &std::process::ExitStatus) -> ProcessStatus {
     if let Some(code) = status.code() {
         return ProcessStatus::Exited { code };
     }
@@ -2921,7 +2930,7 @@ fn process_status_from_output(status: &std::process::ExitStatus) -> ProcessStatu
     ProcessStatus::Unknown
 }
 
-fn classify_terminal_signal(
+pub(crate) fn classify_terminal_signal(
     stdout: &[u8],
     stderr: &[u8],
     status: &ProcessStatus,
@@ -2990,7 +2999,7 @@ fn quota_evidence(stdout: &[u8], stderr: &[u8]) -> String {
     String::from_utf8_lossy(stderr).into_owned()
 }
 
-fn terminal_signal_json(signal: &TerminalSignal) -> Value {
+pub(crate) fn terminal_signal_json(signal: &TerminalSignal) -> Value {
     json!({
         "kind": terminal_signal_kind_str(signal.kind),
         "evidence": signal.evidence,
@@ -3017,7 +3026,7 @@ fn bounded_text(text: &str, max_len: usize) -> String {
     text.chars().take(max_len).collect()
 }
 
-fn now_unix_ms() -> u64 {
+pub(crate) fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -3047,7 +3056,7 @@ fn encode_base64(bytes: &[u8]) -> String {
     encoded
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -3110,6 +3119,32 @@ fn error_response(failure: &ProviderFailure) -> String {
     serde_json::to_string(&response).expect("error serialization is infallible")
 }
 
+/// Host environment selector for `oulipoly.launch_output/v1`.
+pub const HOST_LAUNCH_OUTPUT_ENV: &str = "OULIPOLY_HOST_LAUNCH_OUTPUT_V1";
+
+/// Describe result for a request's own host environment: host-selected
+/// extension capabilities are advertised only when that request selected them.
+pub fn describe_for(host_env: Option<&BTreeMap<String, String>>) -> Value {
+    let mut result = describe_result();
+    let capabilities = result["capabilities"]
+        .as_object_mut()
+        .expect("describe capabilities object");
+    if host_env
+        .and_then(|env| env.get(HOST_LAUNCH_OUTPUT_ENV))
+        .map(String::as_str)
+        == Some("1")
+    {
+        capabilities.insert("launch_output_v1".into(), json!(true));
+    }
+    agent_provider_contract::resident_session::advertise(
+        capabilities,
+        agent_provider_contract::resident_session::SUPPORTED_VERSIONS,
+        host_env,
+    );
+    result
+}
+
+/// Describe result for a request that selected no host extension.
 pub fn describe_result() -> Value {
     json!({
         "provider_id": "claude",

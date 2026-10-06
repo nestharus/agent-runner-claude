@@ -42,11 +42,80 @@ pub fn run_native_effect_gate(args: &[String]) -> i32 {
     run_effect_gate(args, NATIVE_EFFECT_GATE_FD_ENV)
 }
 
+pub(crate) const LAUNCH_OUTPUT_PROTOCOL: &str = "oulipoly.launch_output/v1";
+pub(crate) const LAUNCH_OUTPUT_COMPLETE_MARKER: &str = "oulipoly.launch_output_complete/v1";
+
+/// Whether the launch requested `oulipoly.launch_output/v1` custody. The
+/// request is admitted only when its own host environment selected the
+/// extension and names exactly that protocol.
+fn output_requested(
+    request: &RequestEnvelope,
+    params: &LaunchParams,
+) -> Result<bool, ProviderFailure> {
+    let Some(value) = params
+        .output_delivery
+        .as_ref()
+        .filter(|value| !value.is_null())
+    else {
+        return Ok(false);
+    };
+    let selected = request
+        .host
+        .env
+        .as_ref()
+        .and_then(|env| env.get(crate::HOST_LAUNCH_OUTPUT_ENV))
+        .map(String::as_str)
+        == Some("1");
+    if !selected {
+        return Err(lifecycle_failure(
+            &request.request_id,
+            "launch_output_not_selected",
+            "unsupported",
+            "params.output_delivery requires host.env.OULIPOLY_HOST_LAUNCH_OUTPUT_V1=1",
+            false,
+            3,
+        ));
+    }
+    let object = value
+        .as_object()
+        .filter(|object| object.len() == 1 && object.get("protocol").is_some_and(Value::is_string))
+        .ok_or_else(|| {
+            lifecycle_failure(
+                &request.request_id,
+                "invalid_launch_output_request",
+                "invalid_request",
+                "output_delivery must contain only its protocol",
+                false,
+                2,
+            )
+        })?;
+    if object["protocol"] != LAUNCH_OUTPUT_PROTOCOL {
+        return Err(lifecycle_failure(
+            &request.request_id,
+            "unsupported_launch_output_protocol",
+            "unsupported",
+            "Unsupported launch output delivery protocol",
+            false,
+            3,
+        ));
+    }
+    Ok(true)
+}
+
+/// The completion marker: byte counts and SHA-256 of every data event, and
+/// their count. It is the last event before `exit` on every exit path.
+pub(crate) fn output_complete_marker(accounting: Value) -> Value {
+    let mut value = accounting;
+    value["protocol"] = json!(LAUNCH_OUTPUT_PROTOCOL);
+    json!({"kind":"marker","name":LAUNCH_OUTPUT_COMPLETE_MARKER,"value":value})
+}
+
 pub(crate) fn run<W: Write>(
     request: &RequestEnvelope,
     params: LaunchParams,
     writer: &mut W,
 ) -> Result<i32, ProviderFailure> {
+    let output_requested = output_requested(request, &params)?;
     let state_root = state_root(request)?.join("provider-state/claude/launch");
     create_private_directories(&state_root)
         .map_err(|error| failure(&request.request_id, "launch_io", error.to_string()))?;
@@ -61,6 +130,7 @@ pub(crate) fn run<W: Write>(
     let mut adapter = ClaudeLaunch {
         request,
         params,
+        output_requested,
         stdout: Vec::new(),
         stderr: Vec::new(),
     };
@@ -70,7 +140,7 @@ pub(crate) fn run<W: Write>(
     })
 }
 
-fn state_root(request: &RequestEnvelope) -> Result<PathBuf, ProviderFailure> {
+pub(crate) fn state_root(request: &RequestEnvelope) -> Result<PathBuf, ProviderFailure> {
     if let Some(root) = &request.host.data_root {
         return Ok(PathBuf::from(root));
     }
@@ -94,6 +164,7 @@ fn state_root(request: &RequestEnvelope) -> Result<PathBuf, ProviderFailure> {
 struct ClaudeLaunch<'a> {
     request: &'a RequestEnvelope,
     params: LaunchParams,
+    output_requested: bool,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
 }
@@ -141,9 +212,20 @@ impl LaunchAdapter for ClaudeLaunch<'_> {
 
     fn prepare(&mut self, _custody: &RequestCustody) -> Result<Preparation, ProviderFailure> {
         let params = &self.params;
+        // Settled outcomes carry no data events; a requested completion
+        // marker reports that empty output.
+        let settled_events = || {
+            if self.output_requested {
+                vec![output_complete_marker(
+                    agent_provider_execution::lifecycle::DataAccounting::default().to_json(),
+                )]
+            } else {
+                Vec::new()
+            }
+        };
         let Some((program, args)) = params.argv.split_first() else {
             return Ok(Preparation::Settled {
-                events: Vec::new(),
+                events: settled_events(),
                 terminal: self.spawn_error("Empty command".into(), None),
             });
         };
@@ -151,7 +233,7 @@ impl LaunchAdapter for ClaudeLaunch<'_> {
             Ok(stdin) => stdin,
             Err(reason) => {
                 return Ok(Preparation::Settled {
-                    events: Vec::new(),
+                    events: settled_events(),
                     terminal: self.spawn_error(reason, None),
                 })
             }
@@ -194,6 +276,9 @@ impl LaunchAdapter for ClaudeLaunch<'_> {
         if self.session_known() {
             events.event(Self::session_marker())?;
         }
+        if self.output_requested {
+            events.event(output_complete_marker(events.accounting().to_json()))?;
+        }
         Ok(Some(self.spawn_error(
             format!("Failed to spawn Claude provider command: {error}"),
             self.params.session.clone(),
@@ -224,8 +309,11 @@ impl LaunchAdapter for ClaudeLaunch<'_> {
     fn finish<W: Write>(
         &mut self,
         outcome: NativeOutcome,
-        _events: &mut EventSink<'_, W>,
+        events: &mut EventSink<'_, W>,
     ) -> Result<Terminal, ProviderFailure> {
+        if self.output_requested {
+            events.event(output_complete_marker(events.accounting().to_json()))?;
+        }
         let status = match outcome.stopped {
             Some(_) => ProcessStatus::Cancelled,
             None => process_status_from_output(&outcome.status),
@@ -240,7 +328,11 @@ impl LaunchAdapter for ClaudeLaunch<'_> {
     }
 }
 
-fn failure(request_id: &str, code: &'static str, message: impl Into<String>) -> ProviderFailure {
+pub(crate) fn failure(
+    request_id: &str,
+    code: &'static str,
+    message: impl Into<String>,
+) -> ProviderFailure {
     lifecycle_failure(request_id, code, "failed", message, false, 1)
 }
 
@@ -323,4 +415,24 @@ impl From<LifecycleError> for ProviderFailure {
             LifecycleError::AccountingOverflow => failure("", "launch_output_accounting", message),
         }
     }
+}
+
+/// A native command behind this provider's effect gate.
+pub(crate) fn gated_command(
+    request_id: &str,
+    program: &str,
+    args: &[String],
+) -> Result<GatedCommand, ProviderFailure> {
+    let executable = locate_provider_executable(PROVIDER_BINARY)
+        .map_err(|error| failure(request_id, "launch_io", error.to_string()))?;
+    GatedCommand::new(
+        &EffectGate {
+            executable: &executable,
+            argument: NATIVE_EFFECT_GATE_ARG,
+            descriptor_env: NATIVE_EFFECT_GATE_FD_ENV,
+        },
+        program,
+        args,
+    )
+    .map_err(|error| failure(request_id, "launch_io", error.to_string()))
 }

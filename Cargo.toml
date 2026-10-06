@@ -10,6 +10,7 @@ name = "agent-runner-claude"
 path = "src/main.rs"
 
 [dependencies]
+agent-provider-contract = { git = "https://github.com/nestharus/agent-provider-sdk.git" }
 agent-provider-execution = { git = "https://github.com/nestharus/agent-provider-sdk.git" }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 serde = { version = "1", features = ["derive"] }
