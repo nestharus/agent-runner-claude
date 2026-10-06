@@ -76,14 +76,16 @@ classification and failure codes.
 - Launch output goes through the SDK's `BoundedOutput`: writes to a FIFO or
   socket fail after two seconds without progress, which bounds a stalled
   reader rather than total delivery time; regular files and other descriptors
-  have no write bound. The provider exits 0 once the `exit` event is
-  delivered, including for native nonzero exits, spawn errors and
-  cancellation, so callers must read the `exit` event rather than the provider
-  exit code. A failure after events began appends one `ok: false` error
-  envelope (not a launch event, without a trailing newline) after the events
-  already delivered, with no `exit` event; if output delivery itself failed,
-  no envelope can follow. A delivered `exit` event does not by itself prove
-  the completion record was published.
+  have no write bound. The provider exits 0 after successful launch completion,
+  including exit delivery, journal sealing and completion-state publication,
+  for native nonzero exits, spawn errors and cancellation as well. Callers
+  must read the `exit` event for the native outcome. A failure after events
+  began attempts to append one `ok: false` error envelope (not a launch event,
+  without a trailing newline) after the events already delivered and returns
+  a failure invocation code. A seal or state-publication failure can occur
+  after `exit` delivery, so an error envelope can follow an `exit` event; if
+  output delivery itself failed, no envelope can follow. A delivered `exit`
+  event does not by itself prove successful invocation or durable completion.
 
 Cargo resolves SDK source from its public GitHub repository without a
 manifest source-revision constraint. `Cargo.lock` records the resolved commit
