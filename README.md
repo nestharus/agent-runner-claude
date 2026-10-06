@@ -20,6 +20,7 @@ Implemented commands:
 - `policy.evaluate`
 - `terminal.classify`
 - `launch`
+- `resident.prepare` and `resident.serve` (see Resident sessions)
 
 Example:
 
@@ -27,6 +28,59 @@ Example:
 printf '%s' '{"contract":"oulipoly.provider/v1","request_id":"req-1","host":{"app":"test"},"params":{}}' \
   | agent-runner-claude describe
 ```
+
+## Host-selected extensions
+
+`describe` advertises an extension capability only when the request's own
+`host.env` selected it: `launch_output_v1` for
+`OULIPOLY_HOST_LAUNCH_OUTPUT_V1=1` and `resident_session_v1` for
+`OULIPOLY_HOST_RESIDENT_SESSION_V1=1`. An offer of another resident version
+alone advertises nothing. The carried `contract/v1` describe, common, launch and
+policy schemas are byte-identical to the `agent-provider-sdk` snapshot at commit
+`38acb566f985a77cd6a623257bfe7feb0302da62` (Agent Runner `5d025b82` plus the
+resident capability and advertisement-only widening); `session.schema.json` keeps this provider's earlier
+`session.read_turns` shape, and `session_turn_pages_v1` is not advertised.
+
+**Launch output (`oulipoly.launch_output/v1`).** A launch whose params carry
+`output_delivery: {"protocol": "oulipoly.launch_output/v1"}` is admitted only
+when its host selected the extension; otherwise it is refused
+(`launch_output_not_selected`) before any native effect, never ignored. A
+selected launch ends every exit path (native exit or cancellation, an observed
+start failure, and a launch settled without a native process) with an
+`oulipoly.launch_output_complete/v1` marker as the last event before `exit`:
+byte counts and SHA-256 of all `stdout` and `stderr` data events and their
+count, which Agent Runner's output spool checks against what it received. The
+marker is journaled and replayed with the launch. Without `output_delivery` the
+events are unchanged.
+
+## Resident sessions (`oulipoly.resident_session/v1`)
+
+`resident.prepare` (params: the SDK extension's `protocol` and `launch`
+template, i.e. the Claude Code CLI argv that `policy.evaluate` produced, its
+environment and route) refuses session-selecting flags (`--resume`, `-r`,
+`--continue`, `-c`, `--session-id`, `--fork-session`), drops the template's own
+transport flags (`-p`/`--print`, `--verbose`, `--replay-user-messages`,
+`--output-format`, `--input-format`), records the template durably and
+content-addressed under
+`<data_root>/provider-state/claude/resident/configs/<sha256>.json`, and answers
+`invocation.args = ["resident.serve", "--config", <path>]` with
+`endpoint: "stdio"`, which the host appends to this same registered executable.
+
+`resident.serve` is the SDK's resident ACP v2 endpoint. Each turn runs the
+native Claude Code CLI once through the SDK lifecycle, as
+`<template> -p --input-format stream-json --output-format stream-json --verbose
+--replay-user-messages`, with `--session-id <uuid>` (an id this provider
+chooses) on the session's first turn and `--resume <uuid>` afterwards, in the
+session's working directory, writing one stream-JSON user message on stdin. The
+`system/init` event names the native session; the replayed user message (its
+`uuid`, message content/role, session and no tool parent) is the consumption that acknowledges the prompt; each
+main-thread assistant message with text is one ACP `agent_message` (subagent and
+tool-use records are not); the turn succeeds only with a `result` of subtype
+`success` and no error, otherwise an exit 0 is reported as exit 1. Stderr is
+accounted and kept for terminal classification. `session/cancel` terminates only
+that turn's process group. The native stream-JSON behaviour is exercised here
+against a deterministic fake CLI only (`tests/claude_resident.rs`); it has not
+been qualified against a live Claude Code CLI. Never the Claude Agent SDK.
 
 ## Launch lifecycle
 
@@ -92,3 +146,26 @@ manifest source-revision constraint. `Cargo.lock` records the resolved commit
 for reproducible builds; it is not a runtime compatibility pin. Use
 `cargo update -p agent-provider-execution` to refresh it, then verify the
 adapter. The provider is Linux-only.
+
+Resident correction: queued inputs bind native create/resume at dispatch from
+settled state. Consumption evidence with failed insertion persistence returns
+unknown (`-32011`), without ACK. Interrupted actors are discharged even if the
+current template changes, and are never rerun; unsettled custody cannot claim
+ended/close completion. Close releases its lock and worker. Dedup ACKs attest
+the original key only, not current prompt bytes. Describe admits future
+advertisements through the SDK's typed admission and common-version chooser,
+with declared preference and strict selected v1 payloads. Host replacement
+refresh, installed/native qualification and actual Runner joining remain open.
+The SDK's 0.2.0 v1 snapshot realignment replaces the former session page shape;
+it is not a compatible evolution or a wire major version. Other hosts are
+unqualified. Per-request terminal-unavailable selection remains required.
+
+Claude template parsing consumes known value-bearing options before interpreting
+resident-owned flags. Values such as `--append-system-prompt --resume` or `-p`
+are preserved. Unknown option arity is explicitly refused at prepare; extend
+the adapter's option table for new native options. `system/init` must have a
+UUID-shaped id equal to the selected native session; drift is a turn failure.
+`isReplay` alone never acknowledges input. Assistant records with a tool parent
+or `isSidechain: true` are excluded. Submitted user UUIDs have v4/variant bits.
+These assumptions have only deterministic fake qualification; the actual CLI
+echo/create/resume semantics must be checked before installed cutover.

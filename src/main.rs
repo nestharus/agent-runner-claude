@@ -6,6 +6,10 @@ fn main() {
         std::process::exit(agent_runner_claude::run_native_effect_gate(&args));
     }
 
+    if args.get(1).map(String::as_str) == Some(agent_runner_claude::resident::SERVE) {
+        std::process::exit(agent_runner_claude::resident::serve(&args));
+    }
+
     let mut stdin = String::new();
     if let Err(err) = std::io::stdin().read_to_string(&mut stdin) {
         eprintln!("failed to read stdin: {err}");
