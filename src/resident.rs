@@ -88,6 +88,46 @@ fn resident_root(host: &HostContext) -> Result<PathBuf, ProviderFailure> {
     Ok(data_root.join("provider-state/claude/resident"))
 }
 
+// Value-bearing native options admitted by the policy boundary. Consume their
+// next token as data even when it spells a resident-owned flag. Unknown options
+// are refused because their arity cannot safely be inferred from the next token.
+const VALUE_FLAGS: &[&str] = &[
+    "--append-system-prompt",
+    "--append-system-prompt-file",
+    "--system-prompt",
+    "--system-prompt-file",
+    "--model",
+    "--fallback-model",
+    "--agent",
+    "--agents",
+    "--allowedTools",
+    "--allowed-tools",
+    "--disallowedTools",
+    "--disallowed-tools",
+    "--tools",
+    "--mcp-config",
+    "--permission-mode",
+    "--permission-prompt-tool",
+    "--add-dir",
+    "--max-turns",
+    "--max-budget-usd",
+    "--json-schema",
+    "--settings",
+    "--setting-sources",
+    "--betas",
+    "--debug-file",
+    "--plugin-dir",
+    "--effort",
+];
+const SWITCH_FLAGS: &[&str] = &[
+    "--disable-slash-commands",
+    "--dangerously-skip-permissions",
+    "--allow-dangerously-skip-permissions",
+    "--strict-mcp-config",
+    "--no-session-persistence",
+    "--include-partial-messages",
+];
+
 /// The template argv without transport flags, or why it cannot be resident.
 fn base_argv(argv: &[String]) -> Result<Vec<String>, String> {
     let Some((program, rest)) = argv.split_first() else {
@@ -105,10 +145,26 @@ fn base_argv(argv: &[String]) -> Result<Vec<String>, String> {
         match TRANSPORT_FLAGS.iter().find(|(name, _)| *name == flag) {
             Some((_, takes_value)) => {
                 if *takes_value && !arg.contains('=') {
-                    args.next();
+                    args.next()
+                        .ok_or_else(|| format!("{flag} requires a value"))?;
                 }
             }
-            None => base.push(arg.clone()),
+            None if VALUE_FLAGS.contains(&flag) => {
+                base.push(arg.clone());
+                if !arg.contains('=') {
+                    base.push(
+                        args.next()
+                            .ok_or_else(|| format!("{flag} requires a value"))?
+                            .clone(),
+                    );
+                }
+            }
+            None if SWITCH_FLAGS.contains(&flag) && !arg.contains('=') => base.push(arg.clone()),
+            None => {
+                return Err(format!(
+                    "unsupported resident template argument {arg:?}; option arity must be known"
+                ))
+            }
         }
     }
     Ok(base)
@@ -232,10 +288,7 @@ impl ResidentTurns for ClaudeTurns {
             turn,
             argv: turn_argv(&self.base_argv, turn),
             env: self.config["launch"]["env"].clone(),
-            user_uuid: sha256_hex(turn.request_id.as_bytes())
-                .chars()
-                .take(32)
-                .collect(),
+            user_uuid: input_uuid(&turn.request_id),
             native_session: turn
                 .native_session_id
                 .clone()
@@ -264,17 +317,35 @@ struct ResidentTurn<'a> {
     stderr: Vec<u8>,
 }
 
+fn input_uuid(request_id: &str) -> String {
+    let mut hex = sha256_hex(request_id.as_bytes()).as_bytes()[..32].to_vec();
+    hex[12] = b'4';
+    hex[16] = b"89ab"[(hex[16] as char).to_digit(16).unwrap() as usize & 3];
+    let hex = String::from_utf8(hex).expect("hex is ASCII");
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    )
+}
+
+fn valid_uuid(id: &str) -> bool {
+    id.len() == 36
+        && id.bytes().enumerate().all(|(i, b)| {
+            if [8, 13, 18, 23].contains(&i) {
+                b == b'-'
+            } else {
+                b.is_ascii_hexdigit()
+            }
+        })
+}
+
 impl ResidentTurn<'_> {
     fn user_message(&self) -> Vec<u8> {
-        let uuid = format!(
-            "{}-{}-{}-{}-{}",
-            &self.user_uuid[0..8],
-            &self.user_uuid[8..12],
-            &self.user_uuid[12..16],
-            &self.user_uuid[16..20],
-            &self.user_uuid[20..32]
-        );
-        let mut line = serde_json::to_vec(&json!({"type":"user","uuid":uuid,
+        let mut line = serde_json::to_vec(&json!({"type":"user","uuid":self.user_uuid,
             "session_id":self.native_session.clone().unwrap_or_default(),
             "parent_tool_use_id":null,
             "message":{"role":"user","content":[{"type":"text","text":self.turn.prompt}]}}))
@@ -284,9 +355,13 @@ impl ResidentTurn<'_> {
     }
 
     fn echoes_input(&self, event: &Value) -> bool {
-        let uuid = event["uuid"].as_str().unwrap_or_default().replace('-', "");
         event["type"] == json!("user")
-            && (uuid == self.user_uuid || event["isReplay"] == json!(true))
+            && event["uuid"].as_str() == Some(self.user_uuid.as_str())
+            && event["parent_tool_use_id"].is_null()
+            && event["isSidechain"] != json!(true)
+            && event["message"]["role"] == json!("user")
+            && event["message"]["content"] == json!([{"type":"text","text":self.turn.prompt}])
+            && event["session_id"].as_str() == self.native_session.as_deref()
     }
 }
 
@@ -306,6 +381,17 @@ impl LaunchAdapter for ResidentTurn<'_> {
 
     fn prepare(&mut self, _custody: &RequestCustody) -> Result<Preparation, ProviderFailure> {
         let id = &self.turn.request_id;
+        if self
+            .native_session
+            .as_deref()
+            .is_some_and(|id| !valid_uuid(id))
+        {
+            return Err(launch::failure(
+                id,
+                "invalid_native_session",
+                "native session id must be UUID-shaped",
+            ));
+        }
         let (program, args) = self
             .argv
             .split_first()
@@ -345,7 +431,28 @@ impl LaunchAdapter for ResidentTurn<'_> {
         };
         match event["type"].as_str() {
             Some("system") if event["subtype"] == json!("init") => {
-                if let Some(id) = event["session_id"].as_str() {
+                let id = event["session_id"]
+                    .as_str()
+                    .filter(|id| valid_uuid(id))
+                    .ok_or_else(|| {
+                        launch::failure(
+                            &self.turn.request_id,
+                            "invalid_native_session",
+                            "system/init must name a UUID-shaped session",
+                        )
+                    })?;
+                if self
+                    .native_session
+                    .as_deref()
+                    .is_some_and(|known| known != id)
+                {
+                    return Err(launch::failure(
+                        &self.turn.request_id,
+                        "native_session_changed",
+                        "system/init changed the selected native session",
+                    ));
+                }
+                {
                     self.native_session = Some(id.to_owned());
                     events.marker(
                         endpoint::PROVIDER_SESSION_MARKER,
@@ -362,7 +469,9 @@ impl LaunchAdapter for ResidentTurn<'_> {
                         "source":"claude.stream_json.replay"}),
                 )?;
             }
-            Some("assistant") if event["parent_tool_use_id"].is_null() => {
+            Some("assistant")
+                if event["parent_tool_use_id"].is_null() && event["isSidechain"] != json!(true) =>
+            {
                 let text: String = event["message"]["content"]
                     .as_array()
                     .into_iter()

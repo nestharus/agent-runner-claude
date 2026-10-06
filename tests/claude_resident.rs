@@ -27,25 +27,47 @@ with open(os.environ['CALLS'], 'a') as f:
     f.write(json.dumps({'argv': args, 'stdin': line}) + '\n')
 message = json.loads(line)
 prompt = message['message']['content'][0]['text']
-if '--resume' in args:
-    session = args[args.index('--resume') + 1]
-elif '--session-id' in args:
-    session = args[args.index('--session-id') + 1]
-else:
-    session = 'chosen-by-claude'
+# Native option arity matters: admitted text can itself spell --session-id.
+options = {}
+i = 0
+while i < len(args):
+    flag = args[i]
+    if flag in ['--append-system-prompt', '--model', '--input-format', '--output-format', '--resume', '--session-id']:
+        options[flag] = args[i+1]
+        i += 2
+    else:
+        i += 1
+session = options.get('--resume', options.get('--session-id', 'chosen-by-claude'))
 def emit(event):
     print(json.dumps(event), flush=True)
-emit({'type': 'system', 'subtype': 'init', 'session_id': session, 'model': 'fixture'})
 words = prompt.split()
+if words[0] == 'invalidsession':
+    session = 'not-a-uuid'
+if words[0] == 'driftsession':
+    session = '11111111-1111-4111-8111-111111111111'
+emit({'type': 'system', 'subtype': 'init', 'session_id': session, 'model': 'fixture'})
 if words[0] == 'noconsume':
     sys.exit(4)
-emit({'type': 'user', 'uuid': message['uuid'], 'session_id': session, 'message': message['message']})
+echo = {'type': 'user', 'uuid': message['uuid'], 'session_id': session, 'message': message['message']}
+if words[0] == 'foreignreplay':
+    echo['uuid'] = '22222222-2222-4222-8222-222222222222'
+    echo['isReplay'] = True
+if words[0] == 'uuidwithouthyphens':
+    echo['uuid'] = echo['uuid'].replace('-', '')
+if words[0] == 'foreignsession':
+    echo['session_id'] = '22222222-2222-4222-8222-222222222222'
+if words[0] == 'foreigncontent':
+    echo['message'] = {'role':'user','content':[{'type':'text','text':'unrelated'}]}
+if words[0] == 'toolreplay':
+    echo['parent_tool_use_id'] = 'toolu_parent'
+emit(echo)
 if words[0] == 'hang':
     child = subprocess.Popen(['sleep', '300'])
     open(os.path.join(words[1], 'descendant.pid'), 'w').write(str(child.pid))
     emit({'type': 'assistant', 'parent_tool_use_id': None, 'message': {'content': [{'type': 'text', 'text': 'waiting'}]}})
     child.wait()
     sys.exit(0)
+emit({'type':'assistant','isSidechain':True,'parent_tool_use_id':None,'message':{'content':[{'type':'text','text':'sidechain text'}]}})
 emit({'type': 'assistant', 'parent_tool_use_id': 'toolu_1', 'message': {'content': [{'type': 'text', 'text': 'subagent text'}]}})
 emit({'type': 'assistant', 'parent_tool_use_id': None, 'message': {'content': [{'type': 'tool_use', 'id': 'toolu_2', 'name': 'Read', 'input': {}}]}})
 if words[0] == 'fail':
@@ -64,7 +86,7 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let root = tempfile::Builder::new()
-            .prefix("u92-claude-resident-")
+            .prefix("u92-correction-claude-resident-")
             .tempdir_in("/tmp")
             .unwrap();
         let claude = root.path().join("claude");
@@ -210,6 +232,40 @@ fn describe_advertises_selected_extensions_only() {
     assert_eq!(capabilities["resident_session_v1"], json!(true));
     assert!(!capabilities.contains_key("resident_session_v2"));
     assert_eq!(extension::select(&[1], capabilities), Ok(1));
+    let mut future = selected.clone();
+    future["result"]["contract_versions"] = json!(["oulipoly.provider/v2", "oulipoly.provider/v1"]);
+    future["result"]["preferred_contract"] = json!("oulipoly.provider/v2");
+    future["result"]["capabilities"]["resident_session_v2"] = json!(true);
+    future["result"]["capabilities"]["future_capability"] = json!({"new_shape":42});
+    let admitted = registry
+        .decode_response::<agent_provider_contract::operations::Describe>(
+            &serde_json::to_vec(&future).unwrap(),
+        )
+        .unwrap();
+    let advertised = &admitted.value().result;
+    assert_eq!(
+        agent_provider_contract::negotiation::select_contract_version(
+            &["oulipoly.provider/v1"],
+            &advertised.contract_versions,
+            &advertised.preferred_contract
+        ),
+        Ok("oulipoly.provider/v1".into())
+    );
+    let caps = serde_json::to_value(&advertised.capabilities).unwrap();
+    assert_eq!(extension::select(&[1], caps.as_object().unwrap()), Ok(1));
+    future["result"]["capabilities"]["resident_session_v1"] = json!("true");
+    assert!(registry
+        .decode_response::<agent_provider_contract::operations::Describe>(
+            &serde_json::to_vec(&future).unwrap()
+        )
+        .is_err());
+    future["result"]["capabilities"]["resident_session_v1"] = json!(true);
+    future["result"]["preferred_contract"] = json!("oulipoly.provider/v3");
+    assert!(registry
+        .decode_response::<agent_provider_contract::operations::Describe>(
+            &serde_json::to_vec(&future).unwrap()
+        )
+        .is_err());
 }
 
 #[test]
@@ -567,5 +623,110 @@ fn unconsumed_failed_and_cancelled_turns_keep_their_meaning() {
     }) {
         assert!(start.elapsed() < TIMEOUT, "descendant survived cancel");
         std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn policy_values_spelling_resident_flags_are_preserved() {
+    let f = Fixture::new();
+    for value in [
+        "ordinary text",
+        "--resume",
+        "-p",
+        "--output-format",
+        "--session-id",
+    ] {
+        let model = f.template()["model"].clone();
+        let (code, policy) = f.invoke("policy.evaluate", f.host(json!({})), json!({
+            "settings_id":"test", "mode":"headless", "model":model,
+            "launch":{"command":f.path().join("claude"),"prompt_mode":"stdin","system_prompt_override":value,"env":{"CALLS":f.path().join("calls.jsonl")}}}));
+        let policy: Value = serde_json::from_str(&policy).unwrap();
+        assert_eq!(code, 0, "{policy}");
+        assert_eq!(policy["result"]["accepted"], json!(true));
+        let (code, prepared) = f.invoke(
+            "resident.prepare",
+            f.host(json!({"OULIPOLY_HOST_RESIDENT_SESSION_V1":"1"})),
+            json!({"protocol":"oulipoly.resident_session/v1","launch":{
+                "settings_id":"test","mode":"headless","model":model,
+                "argv":policy["result"]["argv"],"env":policy["result"]["env"]}}),
+        );
+        let prepared: Value = serde_json::from_str(&prepared).unwrap();
+        assert_eq!(code, 0, "{prepared}");
+        let mut client = Client::serve(&prepared["result"]);
+        let session = client.open(&f.path().join("work"));
+        let req = client.prompt(&session, "hello", None);
+        let id = message_id(&client.response(req));
+        client.idle_for(&id);
+        let calls = f.calls();
+        let args = argv(calls.last().unwrap());
+        assert_eq!(
+            flag_value(&args, "--append-system-prompt").as_deref(),
+            Some(value)
+        );
+        assert_eq!(
+            args.iter().filter(|a| *a == "-p").count(),
+            if value == "-p" { 2 } else { 1 }
+        );
+    }
+}
+
+#[test]
+fn consumption_requires_this_input_and_session_identity() {
+    let f = Fixture::new();
+    let prepared = f.prepare();
+    let mut client = Client::serve(&prepared);
+    let session = client.open(&f.path().join("work"));
+    for prompt in [
+        "foreignreplay",
+        "uuidwithouthyphens",
+        "foreignsession",
+        "foreigncontent",
+        "toolreplay",
+    ] {
+        let req = client.prompt(&session, prompt, None);
+        let response = client.response(req);
+        assert_eq!(
+            response["error"]["code"],
+            json!(-32010),
+            "{prompt}: {response}"
+        );
+    }
+    let req = client.prompt(&session, "hello", None);
+    let id = message_id(&client.response(req));
+    assert_eq!(client.idle_for(&id)["stopReason"], json!("end_turn"));
+}
+
+#[test]
+fn native_session_shape_and_drift_are_refused_without_consumption() {
+    for prompt in ["invalidsession", "driftsession"] {
+        let f = Fixture::new();
+        let prepared = f.prepare();
+        let mut client = Client::serve(&prepared);
+        let session = client.open(&f.path().join("work"));
+        let first = client.prompt(&session, "hello", None);
+        let id = message_id(&client.response(first));
+        client.idle_for(&id);
+        let known = flag_value(&argv(&f.calls()[0]), "--session-id").unwrap();
+        let req = client.prompt(&session, prompt, None);
+        let response = client.response(req);
+        assert_eq!(response["error"]["code"], json!(-32011), "{response}");
+        let config_path = PathBuf::from(prepared["invocation"]["args"][2].as_str().unwrap());
+        let record_path = config_path
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("sessions")
+            .join(&session)
+            .join("session.json");
+        let record: Value = serde_json::from_slice(&std::fs::read(record_path).unwrap()).unwrap();
+        assert_eq!(record["native_session_id"], json!(known));
+        let next = client.prompt(&session, "hello", None);
+        let next = message_id(&client.response(next));
+        client.idle_for(&next);
+        assert_eq!(
+            flag_value(&argv(f.calls().last().unwrap()), "--resume"),
+            Some(known)
+        );
     }
 }
