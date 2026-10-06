@@ -1,0 +1,364 @@
+//! Claude plug points for the SDK's shared one-shot launch lifecycle.
+//!
+//! The SDK owns request custody, exact replay, interrupted-actor discharge and
+//! reconciliation, admission against termination signals and the host
+//! deadline, the native effect gate, process-group custody, draining,
+//! heartbeats and the sealed completion receipt. This module supplies the
+//! Claude request digest, the host-supplied argv/environment/stdin, raw byte
+//! framing of native output, the `provider_session_known` marker, and Claude
+//! terminal classification. Launch keeps this provider's contract: native
+//! failures, including commands that cannot be spawned, are reported in the
+//! `exit` event and the provider exits 0 once that event is delivered.
+
+use crate::{
+    byte_payload_bytes, classify_terminal_signal, now_unix_ms, process_status_from_output,
+    sha256_hex, terminal_signal_json, LaunchParams, ProcessStatus, ProviderFailure,
+    RequestEnvelope, CONTRACT,
+};
+use agent_provider_execution::{
+    custody::{CustodyError, RequestCustody},
+    durable_fs::create_private_directories,
+    framing::FramingError,
+    lifecycle::{
+        self, Channel, EventSink, LaunchAdapter, LaunchSpec, LifecycleError, LifecycleTiming,
+        NativeCommand, NativeOutcome, OutputFraming, Preparation, Terminal,
+    },
+    process::{locate_provider_executable, run_effect_gate, EffectGate, GatedCommand},
+};
+use serde_json::{json, Value};
+use std::io::{self, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+
+pub const NATIVE_EFFECT_GATE_ARG: &str = "__native_effect_gate";
+const NATIVE_EFFECT_GATE_FD_ENV: &str = "AGENT_RUNNER_CLAUDE_NATIVE_EFFECT_GATE_FD";
+const PROVIDER_BINARY: &str = "agent-runner-claude";
+const OUTPUT_CHUNK_BYTES: usize = 16 * 1024;
+// Linux errno values reported for commands that cannot be spawned.
+const ENOENT: i32 = 2;
+const EACCES: i32 = 13;
+
+/// Runs the native effect gate inside this provider binary.
+pub fn run_native_effect_gate(args: &[String]) -> i32 {
+    run_effect_gate(args, NATIVE_EFFECT_GATE_FD_ENV)
+}
+
+pub(crate) fn run<W: Write>(
+    request: &RequestEnvelope,
+    params: LaunchParams,
+    writer: &mut W,
+) -> Result<i32, ProviderFailure> {
+    let state_root = state_root(request)?.join("provider-state/claude/launch");
+    create_private_directories(&state_root)
+        .map_err(|error| failure(&request.request_id, "launch_io", error.to_string()))?;
+    let spec = LaunchSpec {
+        contract: CONTRACT,
+        request_id: &request.request_id,
+        provider_instance_id: request.provider_instance_id.as_deref(),
+        deadline_unix_ms: request.host.deadline_unix_ms,
+        state_root: &state_root,
+        timing: LifecycleTiming::default(),
+    };
+    let mut adapter = ClaudeLaunch {
+        request,
+        params,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    };
+    lifecycle::run_launch(&spec, &mut adapter, writer).map_err(|mut error: ProviderFailure| {
+        error.request_id = request.request_id.clone();
+        error
+    })
+}
+
+fn state_root(request: &RequestEnvelope) -> Result<PathBuf, ProviderFailure> {
+    if let Some(root) = &request.host.data_root {
+        return Ok(PathBuf::from(root));
+    }
+    request
+        .host
+        .env
+        .as_ref()
+        .and_then(|env| env.get("HOME").cloned())
+        .or_else(|| std::env::var("HOME").ok())
+        .filter(|home| !home.is_empty())
+        .map(|home| Path::new(&home).join(".local/share/oulipoly-agent-runner"))
+        .ok_or_else(|| {
+            failure(
+                &request.request_id,
+                "launch_state_unavailable",
+                "launch custody requires host.data_root or HOME",
+            )
+        })
+}
+
+struct ClaudeLaunch<'a> {
+    request: &'a RequestEnvelope,
+    params: LaunchParams,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+impl ClaudeLaunch<'_> {
+    fn session_known(&self) -> bool {
+        self.params
+            .session
+            .as_ref()
+            .and_then(|value| value.get("provider_session_id"))
+            .and_then(Value::as_str)
+            .is_some()
+    }
+
+    fn spawn_error(&self, reason: String, session: Option<Value>) -> Terminal {
+        let status = ProcessStatus::SpawnError { reason };
+        let signal = classify_terminal_signal(&[], &[], &status, now_unix_ms());
+        Terminal {
+            status: serde_json::to_value(&status).expect("process status serializes"),
+            terminal_signal: terminal_signal_json(&signal),
+            session,
+            exit_code: 0,
+        }
+    }
+
+    fn session_marker() -> Value {
+        json!({"kind":"marker","name":"provider_session_known","value":true})
+    }
+}
+
+impl LaunchAdapter for ClaudeLaunch<'_> {
+    type Failure = ProviderFailure;
+
+    /// Every launch input that determines the native effect. Executable and
+    /// provider build identity are deliberately absent.
+    fn request_digest(&mut self) -> Result<String, ProviderFailure> {
+        let request = self.request;
+        Ok(sha256_hex(
+            &serde_json::to_vec(&json!({"params":request.params,
+                "host_env":request.host.env,
+                "host_working_directory":request.host.working_directory}))
+            .expect("launch digest input serializes"),
+        ))
+    }
+
+    fn prepare(&mut self, _custody: &RequestCustody) -> Result<Preparation, ProviderFailure> {
+        let params = &self.params;
+        let Some((program, args)) = params.argv.split_first() else {
+            return Ok(Preparation::Settled {
+                events: Vec::new(),
+                terminal: self.spawn_error("Empty command".into(), None),
+            });
+        };
+        let stdin = match params.stdin.as_ref().map(byte_payload_bytes).transpose() {
+            Ok(stdin) => stdin,
+            Err(reason) => {
+                return Ok(Preparation::Settled {
+                    events: Vec::new(),
+                    terminal: self.spawn_error(reason, None),
+                })
+            }
+        };
+        if let Some(error) = spawn_refusal(program, &params.working_directory, &params.env) {
+            let events = if self.session_known() {
+                vec![Self::session_marker()]
+            } else {
+                Vec::new()
+            };
+            return Ok(Preparation::Settled {
+                events,
+                terminal: self.spawn_error(
+                    format!("Failed to spawn Claude provider command: {error}"),
+                    params.session.clone(),
+                ),
+            });
+        }
+        let executable = locate_provider_executable(PROVIDER_BINARY)
+            .map_err(|error| failure(&self.request.request_id, "launch_io", error.to_string()))?;
+        let mut command = GatedCommand::new(
+            &EffectGate {
+                executable: &executable,
+                argument: NATIVE_EFFECT_GATE_ARG,
+                descriptor_env: NATIVE_EFFECT_GATE_FD_ENV,
+            },
+            program,
+            args,
+        )
+        .map_err(|error| failure(&self.request.request_id, "launch_io", error.to_string()))?;
+        command
+            .command_mut()
+            .current_dir(&params.working_directory)
+            .envs(&params.env);
+        Ok(Preparation::Native(NativeCommand {
+            command,
+            stdin,
+            framing: OutputFraming::Chunks {
+                max_bytes: OUTPUT_CHUNK_BYTES,
+            },
+        }))
+    }
+
+    fn started<W: Write>(&mut self, events: &mut EventSink<'_, W>) -> Result<(), ProviderFailure> {
+        if self.session_known() {
+            events.event(Self::session_marker())?;
+        }
+        Ok(())
+    }
+
+    fn output<W: Write>(
+        &mut self,
+        channel: Channel,
+        bytes: Vec<u8>,
+        events: &mut EventSink<'_, W>,
+    ) -> Result<(), ProviderFailure> {
+        events.data(channel, &bytes)?;
+        match channel {
+            Channel::Stdout => self.stdout.extend(bytes),
+            Channel::Stderr => self.stderr.extend(bytes),
+        }
+        Ok(())
+    }
+
+    fn finish<W: Write>(
+        &mut self,
+        outcome: NativeOutcome,
+        _events: &mut EventSink<'_, W>,
+    ) -> Result<Terminal, ProviderFailure> {
+        let status = match outcome.stopped {
+            Some(_) => ProcessStatus::Cancelled,
+            None => process_status_from_output(&outcome.status),
+        };
+        let signal = classify_terminal_signal(&self.stdout, &self.stderr, &status, now_unix_ms());
+        Ok(Terminal {
+            status: serde_json::to_value(&status).expect("process status serializes"),
+            terminal_signal: terminal_signal_json(&signal),
+            session: self.params.session.clone(),
+            exit_code: 0,
+        })
+    }
+}
+
+/// Reports why the host-supplied command cannot be spawned, so the contract's
+/// `spawn_error` exit replaces a gate failure. The gate resolves the program
+/// again at exec; a change between this check and exec surfaces as the
+/// gate's exit status 126 with its diagnostic on stderr.
+fn spawn_refusal(
+    program: &str,
+    working_directory: &str,
+    env: &std::collections::BTreeMap<String, String>,
+) -> Option<io::Error> {
+    let working_directory = Path::new(working_directory);
+    if !working_directory.is_dir() {
+        return Some(io::Error::from_raw_os_error(ENOENT));
+    }
+    let candidates = if program.contains('/') {
+        vec![working_directory.join(program)]
+    } else {
+        let path = env
+            .get("PATH")
+            .cloned()
+            .or_else(|| std::env::var("PATH").ok())
+            .unwrap_or_default();
+        path.split(':')
+            .filter(|directory| !directory.is_empty())
+            .map(|directory| Path::new(directory).join(program))
+            .collect()
+    };
+    let mut found = false;
+    for candidate in candidates {
+        if let Ok(metadata) = std::fs::metadata(&candidate) {
+            if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
+                return None;
+            }
+            found = true;
+        }
+    }
+    Some(io::Error::from_raw_os_error(if found {
+        EACCES
+    } else {
+        ENOENT
+    }))
+}
+
+fn failure(request_id: &str, code: &'static str, message: impl Into<String>) -> ProviderFailure {
+    lifecycle_failure(request_id, code, "failed", message, false, 1)
+}
+
+fn lifecycle_failure(
+    request_id: &str,
+    code: &'static str,
+    category: &'static str,
+    message: impl Into<String>,
+    retryable: bool,
+    exit_code: i32,
+) -> ProviderFailure {
+    ProviderFailure {
+        request_id: request_id.to_string(),
+        code,
+        category,
+        message: message.into(),
+        retryable,
+        details: json!({}),
+        exit_code,
+    }
+}
+
+fn custody_failure(error: CustodyError) -> ProviderFailure {
+    match error {
+        CustodyError::Busy => lifecycle_failure(
+            "",
+            "launch_busy",
+            "conflict",
+            "This request is already executing",
+            true,
+            2,
+        ),
+        CustodyError::InvalidState => failure("", "launch_state_invalid", "Invalid launch state"),
+        CustodyError::StateWrite(message) => failure("", "launch_state_write", message),
+        CustodyError::JournalMissing | CustodyError::JournalMismatch => {
+            failure("", "launch_journal_invalid", error.to_string())
+        }
+        CustodyError::JournalOverflow => failure("", "launch_output_accounting", error.to_string()),
+        CustodyError::Io(error) => failure("", "launch_io", error.to_string()),
+    }
+}
+
+/// Claude failure codes and categories for the shared lifecycle's outcomes.
+impl From<LifecycleError> for ProviderFailure {
+    fn from(error: LifecycleError) -> Self {
+        let message = error.to_string();
+        match error {
+            LifecycleError::Busy => custody_failure(CustodyError::Busy),
+            LifecycleError::RequestChanged => {
+                lifecycle_failure("", "request_changed", "conflict", message, false, 2)
+            }
+            LifecycleError::ReconciliationRequired => lifecycle_failure(
+                "",
+                "launch_reconciliation_required",
+                "conflict",
+                "Prior invocation ended before terminal custody; inspect the Claude session before issuing a new request",
+                false,
+                2,
+            ),
+            LifecycleError::Cancelled => failure("", "launch_cancelled", message),
+            LifecycleError::DeadlineElapsed => {
+                lifecycle_failure("", "launch_deadline", "timeout", message, false, 1)
+            }
+            LifecycleError::Custody(error) => custody_failure(error),
+            LifecycleError::Framing(FramingError::Overflow) => {
+                failure("", "launch_output_accounting", message)
+            }
+            LifecycleError::Framing(FramingError::Io(_)) | LifecycleError::Io(_) => {
+                failure("", "launch_io", message)
+            }
+            LifecycleError::NativeStreamInvalid => failure("", "native_stream_invalid", message),
+            LifecycleError::NativeStreamsClosed => failure("", "native_streams_closed", message),
+            LifecycleError::NativeDrainIncomplete => {
+                failure("", "native_stream_drain_incomplete", message)
+            }
+            LifecycleError::InputStalled
+            | LifecycleError::InputWriterFailed
+            | LifecycleError::InputIncomplete => failure("", "stdin_failed", message),
+            LifecycleError::WaitFailed => failure("", "native_wait_failed", message),
+            LifecycleError::AccountingOverflow => failure("", "launch_output_accounting", message),
+        }
+    }
+}
