@@ -304,3 +304,89 @@ fn unspawnable_command_is_a_spawn_error_exit_and_replays() {
     assert_eq!(events[1]["session"]["provider_session_id"], "known-session");
     assert_eq!(fixture.run(&request).stdout, first.stdout);
 }
+
+fn write_executable(path: &Path, text: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, text).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn relative_and_empty_path_entries_resolve_in_the_native_working_directory() {
+    for (path, place) in [
+        ("bin", "bin/u89-path-probe"),
+        (":", "u89-path-probe"),
+        (":/no-such-u89-directory", "u89-path-probe"),
+    ] {
+        let fixture = Fixture::new();
+        let native = fixture.path("native");
+        write_executable(&native.join(place), "#!/bin/sh\necho found\n");
+        let mut request = fixture.request("unused");
+        request["params"]["argv"] = json!(["u89-path-probe"]);
+        request["params"]["working_directory"] = json!(native);
+        request["params"]["env"] = json!({ "PATH": path });
+        let output = fixture.run(&request);
+        assert!(output.status.success(), "PATH={path}: {output:?}");
+        let events = lines(&output);
+        assert_eq!(data(&events, "stdout"), "found\n", "PATH={path}");
+        assert_eq!(
+            events.last().unwrap()["status"],
+            json!({"kind":"exited","code":0}),
+            "PATH={path}"
+        );
+    }
+}
+
+#[test]
+fn missing_interpreter_is_a_spawn_error_without_gate_output() {
+    let fixture = Fixture::new();
+    let script = fixture.path("missing-interpreter");
+    write_executable(&script, "#!/nonexistent/u89-interpreter\necho ran\n");
+    let mut request = fixture.request("unused");
+    request["params"]["argv"] = json!([script]);
+    let first = fixture.run(&request);
+    assert!(first.status.success(), "{first:?}");
+    let events = lines(&first);
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!(events[0]["name"], "provider_session_known");
+    assert_eq!(
+        events[1]["status"],
+        json!({"kind":"spawn_error",
+            "reason":"Failed to spawn Claude provider command: No such file or directory (os error 2)"})
+    );
+    assert_eq!(events[1]["terminal_signal"]["kind"], "spawn_error");
+    assert_eq!(events[1]["session"]["provider_session_id"], "known-session");
+    assert_eq!(fixture.run(&request).stdout, first.stdout);
+}
+
+#[test]
+fn native_exit_126_with_gate_like_stderr_stays_a_native_exit() {
+    let fixture = Fixture::new();
+    let request = fixture.request(
+        "echo call >> calls; echo 'native effect gate could not execute native command: No such file or directory (os error 2)' >&2; exit 126",
+    );
+    let output = fixture.run(&request);
+    assert!(output.status.success(), "{output:?}");
+    let events = lines(&output);
+    let exit = events.last().unwrap();
+    assert_eq!(exit["status"], json!({"kind":"exited","code":126}));
+    assert_eq!(exit["terminal_signal"]["kind"], "nonzero_exit");
+    assert!(data(&events, "stderr").contains("native effect gate"));
+    assert_eq!(fixture.calls(), 1);
+}
+
+#[test]
+fn missing_working_directory_is_a_spawn_error() {
+    let fixture = Fixture::new();
+    let mut request = fixture.request("echo call >> calls");
+    request["params"]["working_directory"] = json!(fixture.path("missing-directory"));
+    let output = fixture.run(&request);
+    assert!(output.status.success(), "{output:?}");
+    let exit = lines(&output).pop().unwrap();
+    assert_eq!(
+        exit["status"],
+        json!({"kind":"spawn_error",
+            "reason":"Failed to spawn Claude provider command: No such file or directory (os error 2)"})
+    );
+}

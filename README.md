@@ -49,23 +49,41 @@ classification and failure codes.
   the recorded native process group and fails with
   `launch_reconciliation_required` rather than running the command again; use a
   new request ID after reconciling.
-- `host.deadline_unix_ms` is honored: an elapsed deadline refuses the launch
-  with `launch_deadline` before any native effect, and a deadline reached
+- `host.deadline_unix_ms` is honored: a deadline that elapses before the
+  native command is admitted, including while the launch is being prepared,
+  refuses the launch with `launch_deadline` (category `timeout`) before any
+  native effect and without consuming the request ID; a deadline reached
   during the run terminates the native process group and reports a `cancelled`
-  exit. `SIGTERM`/`SIGINT` to the provider do the same.
+  exit. `SIGTERM`/`SIGINT` to the provider do the same (`launch_cancelled`
+  before admission). The `cancelled` exit does not distinguish deadline from
+  signal.
 - The native command leads its own process group. When its leader exits, the
   remaining group is terminated and output is drained, so descendants holding
   output pipes cannot strand completion. Output that closes without the
   command exiting, or that stays open and silent after termination, fails the
   launch after a two-second grace and leaves it for reconciliation.
-- Commands that cannot be spawned (empty argv, invalid stdin encoding, missing
-  working directory, or a program that is not found or not executable) are
-  still reported as a `spawn_error` exit and recorded like any other outcome.
-  A program removed between that check and exec surfaces as exit status 126
-  from the native effect gate.
-- Launch output uses nonblocking writes with a two-second no-progress limit.
-  The provider exits 0 once the `exit` event is delivered; failures after
-  events began are reported as a final error envelope line.
+- Commands that cannot be spawned are reported as a `spawn_error` exit with
+  the actual OS error and recorded like any other outcome: empty argv and
+  invalid stdin encoding before any process starts, and otherwise the SDK's
+  observed failure to start the command in its working directory or to `exec`
+  it (not found on the request's `PATH`, which is resolved in that directory,
+  not executable, or a missing interpreter). Nothing predicts this from
+  `PATH` or permission bits. A command that runs and exits 126 remains a
+  native `exited` result, whatever it writes to stderr.
+- Incomplete stdin delivery to a command that exits 0 fails with
+  `stdin_failed` and leaves the launch for reconciliation rather than
+  reporting success.
+- Launch output goes through the SDK's `BoundedOutput`: writes to a FIFO or
+  socket fail after two seconds without progress, which bounds a stalled
+  reader rather than total delivery time; regular files and other descriptors
+  have no write bound. The provider exits 0 once the `exit` event is
+  delivered, including for native nonzero exits, spawn errors and
+  cancellation, so callers must read the `exit` event rather than the provider
+  exit code. A failure after events began appends one `ok: false` error
+  envelope (not a launch event, without a trailing newline) after the events
+  already delivered, with no `exit` event; if output delivery itself failed,
+  no envelope can follow. A delivered `exit` event does not by itself prove
+  the completion record was published.
 
 Cargo resolves SDK source from its public GitHub repository without a
 manifest source-revision constraint. `Cargo.lock` records the resolved commit

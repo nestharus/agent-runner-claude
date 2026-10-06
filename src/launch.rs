@@ -8,7 +8,10 @@
 //! framing of native output, the `provider_session_known` marker, and Claude
 //! terminal classification. Launch keeps this provider's contract: native
 //! failures, including commands that cannot be spawned, are reported in the
-//! `exit` event and the provider exits 0 once that event is delivered.
+//! `exit` event and the provider exits 0 once that event is delivered. A
+//! command that cannot be spawned is the SDK's observed start failure at the
+//! gate's spawn or `exec`, never a prediction from `PATH` or permission bits
+//! and never an inference from exit status 126 or stderr text.
 
 use crate::{
     byte_payload_bytes, classify_terminal_signal, now_unix_ms, process_status_from_output,
@@ -21,22 +24,18 @@ use agent_provider_execution::{
     framing::FramingError,
     lifecycle::{
         self, Channel, EventSink, LaunchAdapter, LaunchSpec, LifecycleError, LifecycleTiming,
-        NativeCommand, NativeOutcome, OutputFraming, Preparation, Terminal,
+        NativeCommand, NativeOutcome, OutputFraming, Preparation, StartFailure, Terminal,
     },
     process::{locate_provider_executable, run_effect_gate, EffectGate, GatedCommand},
 };
 use serde_json::{json, Value};
-use std::io::{self, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub const NATIVE_EFFECT_GATE_ARG: &str = "__native_effect_gate";
 const NATIVE_EFFECT_GATE_FD_ENV: &str = "AGENT_RUNNER_CLAUDE_NATIVE_EFFECT_GATE_FD";
 const PROVIDER_BINARY: &str = "agent-runner-claude";
 const OUTPUT_CHUNK_BYTES: usize = 16 * 1024;
-// Linux errno values reported for commands that cannot be spawned.
-const ENOENT: i32 = 2;
-const EACCES: i32 = 13;
 
 /// Runs the native effect gate inside this provider binary.
 pub fn run_native_effect_gate(args: &[String]) -> i32 {
@@ -157,20 +156,6 @@ impl LaunchAdapter for ClaudeLaunch<'_> {
                 })
             }
         };
-        if let Some(error) = spawn_refusal(program, &params.working_directory, &params.env) {
-            let events = if self.session_known() {
-                vec![Self::session_marker()]
-            } else {
-                Vec::new()
-            };
-            return Ok(Preparation::Settled {
-                events,
-                terminal: self.spawn_error(
-                    format!("Failed to spawn Claude provider command: {error}"),
-                    params.session.clone(),
-                ),
-            });
-        }
         let executable = locate_provider_executable(PROVIDER_BINARY)
             .map_err(|error| failure(&self.request.request_id, "launch_io", error.to_string()))?;
         let mut command = GatedCommand::new(
@@ -194,6 +179,25 @@ impl LaunchAdapter for ClaudeLaunch<'_> {
                 max_bytes: OUTPUT_CHUNK_BYTES,
             },
         }))
+    }
+
+    /// The command could not be spawned: its working directory or the gate
+    /// process could not be set up, or `exec` of the program failed. Reported
+    /// as the contract's `spawn_error` with the actual OS error, as when the
+    /// provider spawned the command directly.
+    fn start_failed<W: Write>(
+        &mut self,
+        failure: &StartFailure,
+        events: &mut EventSink<'_, W>,
+    ) -> Result<Option<Terminal>, ProviderFailure> {
+        let (StartFailure::Spawn(error) | StartFailure::Exec(error)) = failure;
+        if self.session_known() {
+            events.event(Self::session_marker())?;
+        }
+        Ok(Some(self.spawn_error(
+            format!("Failed to spawn Claude provider command: {error}"),
+            self.params.session.clone(),
+        )))
     }
 
     fn started<W: Write>(&mut self, events: &mut EventSink<'_, W>) -> Result<(), ProviderFailure> {
@@ -234,48 +238,6 @@ impl LaunchAdapter for ClaudeLaunch<'_> {
             exit_code: 0,
         })
     }
-}
-
-/// Reports why the host-supplied command cannot be spawned, so the contract's
-/// `spawn_error` exit replaces a gate failure. The gate resolves the program
-/// again at exec; a change between this check and exec surfaces as the
-/// gate's exit status 126 with its diagnostic on stderr.
-fn spawn_refusal(
-    program: &str,
-    working_directory: &str,
-    env: &std::collections::BTreeMap<String, String>,
-) -> Option<io::Error> {
-    let working_directory = Path::new(working_directory);
-    if !working_directory.is_dir() {
-        return Some(io::Error::from_raw_os_error(ENOENT));
-    }
-    let candidates = if program.contains('/') {
-        vec![working_directory.join(program)]
-    } else {
-        let path = env
-            .get("PATH")
-            .cloned()
-            .or_else(|| std::env::var("PATH").ok())
-            .unwrap_or_default();
-        path.split(':')
-            .filter(|directory| !directory.is_empty())
-            .map(|directory| Path::new(directory).join(program))
-            .collect()
-    };
-    let mut found = false;
-    for candidate in candidates {
-        if let Ok(metadata) = std::fs::metadata(&candidate) {
-            if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
-                return None;
-            }
-            found = true;
-        }
-    }
-    Some(io::Error::from_raw_os_error(if found {
-        EACCES
-    } else {
-        ENOENT
-    }))
 }
 
 fn failure(request_id: &str, code: &'static str, message: impl Into<String>) -> ProviderFailure {
