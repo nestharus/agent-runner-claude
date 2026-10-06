@@ -1155,7 +1155,8 @@ fn terminal_classify_matches_claude_exit_vocabulary_without_quota_substrings() {
 
 #[test]
 fn launch_stream_preserves_stdout_and_stderr_bytes() {
-    let output = invoke(
+    let data_root = temp_config_root("launch-bytes");
+    let output = invoke_with_host(
         "launch",
         json!({
             "settings_id": "claude-primary",
@@ -1173,6 +1174,7 @@ fn launch_stream_preserves_stdout_and_stderr_bytes() {
             "working_directory": "/tmp",
             "env": {}
         }),
+        json!({ "data_root": data_root }),
     );
     assert!(output.status.success());
     assert!(
@@ -1210,7 +1212,8 @@ fn launch_stream_preserves_stdout_and_stderr_bytes() {
 
 #[test]
 fn launch_stream_reports_session_marker_and_nonzero_exit() {
-    let output = invoke(
+    let data_root = temp_config_root("launch-session");
+    let output = invoke_with_host(
         "launch",
         json!({
             "settings_id": "claude-primary",
@@ -1225,6 +1228,7 @@ fn launch_stream_reports_session_marker_and_nonzero_exit() {
             "env": {},
             "session": { "provider_session_id": "known-session" }
         }),
+        json!({ "data_root": data_root }),
     );
     assert!(output.status.success());
     let lines = String::from_utf8(output.stdout).unwrap();
@@ -1246,7 +1250,8 @@ fn launch_stream_reports_session_marker_and_nonzero_exit() {
 
 #[test]
 fn launch_stream_rejects_invalid_stdin_base64_before_spawn() {
-    let output = invoke(
+    let data_root = temp_config_root("launch-invalid-stdin");
+    let output = invoke_with_host(
         "launch",
         json!({
             "settings_id": "claude-primary",
@@ -1261,6 +1266,7 @@ fn launch_stream_rejects_invalid_stdin_base64_before_spawn() {
             "env": {},
             "stdin": { "encoding": "base64", "data": "@@not-base64@@" }
         }),
+        json!({ "data_root": data_root }),
     );
     assert!(output.status.success());
     let lines = String::from_utf8(output.stdout).unwrap();

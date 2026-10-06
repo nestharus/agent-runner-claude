@@ -8,10 +8,12 @@ use std::io::{BufRead, BufReader};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+mod launch;
+pub use launch::{run_native_effect_gate, NATIVE_EFFECT_GATE_ARG};
 
 pub const CONTRACT: &str = "oulipoly.provider/v1";
 pub const SETTINGS_SCHEMA_ID: &str = "claude.settings/v1";
@@ -252,12 +254,6 @@ struct TerminalSignal {
     observed_at_unix_ms: u64,
 }
 
-#[derive(Debug)]
-enum DrainEvent {
-    Stdout(Vec<u8>),
-    Stderr(Vec<u8>),
-}
-
 #[derive(Debug, Deserialize)]
 struct LaunchPolicy {
     #[serde(default = "default_command")]
@@ -307,11 +303,6 @@ struct ProviderFailure {
     retryable: bool,
     details: Value,
     exit_code: i32,
-}
-
-enum ProviderReply {
-    Json(Value),
-    Raw(String),
 }
 
 impl ProviderFailure {
@@ -364,19 +355,11 @@ impl ProviderFailure {
 }
 
 pub fn handle_invocation(args: &[String], stdin: &str) -> InvocationOutput {
-    match handle_invocation_result(args, stdin) {
-        Ok(ProviderReply::Json(value)) => InvocationOutput {
-            stdout: serde_json::to_string(&value).expect("response serialization is infallible"),
-            exit_code: 0,
-        },
-        Ok(ProviderReply::Raw(stdout)) => InvocationOutput {
-            stdout,
-            exit_code: 0,
-        },
-        Err(failure) => InvocationOutput {
-            stdout: error_response(&failure),
-            exit_code: failure.exit_code,
-        },
+    let mut stdout = Vec::new();
+    let exit_code = write_invocation(args, stdin, &mut stdout);
+    InvocationOutput {
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        exit_code,
     }
 }
 
@@ -398,10 +381,8 @@ fn write_invocation_result<W: Write>(
     let request = decode_request(stdin)?;
     let subcommand = subcommand_from_args(args, request.request_id.clone())?;
     if subcommand == "launch" {
-        let request_id = request.request_id.clone();
-        let params = decode_launch_params(request)?;
-        stream_launch(&request_id, params, writer)?;
-        return Ok(0);
+        let params = decode_launch_params(&request)?;
+        return launch::run(&request, params, writer);
     }
 
     let response = handle_decoded_invocation(request, subcommand)?;
@@ -421,21 +402,6 @@ fn write_invocation_result<W: Write>(
             exit_code: 1,
         })?;
     Ok(0)
-}
-
-fn handle_invocation_result(
-    args: &[String],
-    stdin: &str,
-) -> Result<ProviderReply, ProviderFailure> {
-    let request = decode_request(stdin)?;
-    let subcommand = subcommand_from_args(args, request.request_id.clone())?;
-    if subcommand == "launch" {
-        let request_id = request.request_id.clone();
-        let params = decode_launch_params(request)?;
-        return Ok(ProviderReply::Raw(run_launch(&request_id, params)));
-    }
-
-    handle_decoded_invocation(request, subcommand).map(ProviderReply::Json)
 }
 
 fn handle_decoded_invocation(
@@ -975,8 +941,8 @@ fn session_replace_response(request: RequestEnvelope) -> Result<Value, ProviderF
     ))
 }
 
-fn decode_launch_params(request: RequestEnvelope) -> Result<LaunchParams, ProviderFailure> {
-    let params: LaunchParams = serde_json::from_value(request.params).map_err(|err| {
+fn decode_launch_params(request: &RequestEnvelope) -> Result<LaunchParams, ProviderFailure> {
+    let params: LaunchParams = serde_json::from_value(request.params.clone()).map_err(|err| {
         ProviderFailure::invalid_request(
             request.request_id.clone(),
             "invalid_launch_params",
@@ -984,174 +950,6 @@ fn decode_launch_params(request: RequestEnvelope) -> Result<LaunchParams, Provid
         )
     })?;
     Ok(params)
-}
-
-fn run_launch(request_id: &str, params: LaunchParams) -> String {
-    let mut output = Vec::new();
-    let _ = stream_launch(request_id, params, &mut output);
-    String::from_utf8(output).expect("launch JSONL stream is UTF-8")
-}
-
-fn stream_launch<W: Write>(
-    request_id: &str,
-    params: LaunchParams,
-    writer: &mut W,
-) -> Result<(), ProviderFailure> {
-    let mut stream = LaunchStream::new(request_id, writer);
-    if params.argv.is_empty() {
-        let status = ProcessStatus::SpawnError {
-            reason: "Empty command".to_string(),
-        };
-        let signal = classify_terminal_signal(&[], &[], &status, now_unix_ms());
-        stream.exit(status, signal, None);
-        return Ok(());
-    }
-    let stdin_payload = match params.stdin.as_ref().map(byte_payload_bytes).transpose() {
-        Ok(payload) => payload,
-        Err(reason) => {
-            let status = ProcessStatus::SpawnError { reason };
-            let signal = classify_terminal_signal(&[], &[], &status, now_unix_ms());
-            stream.exit(status, signal, None);
-            return Ok(());
-        }
-    };
-    let session = params.session.clone();
-    if session
-        .as_ref()
-        .and_then(|value| value.get("provider_session_id"))
-        .and_then(Value::as_str)
-        .is_some()
-    {
-        stream.marker("provider_session_known");
-    }
-
-    let mut command = Command::new(&params.argv[0]);
-    command.args(&params.argv[1..]);
-    command.current_dir(&params.working_directory);
-    command.envs(params.env);
-    command.stdout(Stdio::piped());
-    command.stderr(Stdio::piped());
-    command.stdin(if stdin_payload.is_some() {
-        Stdio::piped()
-    } else {
-        Stdio::null()
-    });
-
-    match command.spawn() {
-        Ok(mut child) => {
-            if let Some(payload) = stdin_payload {
-                if let Some(mut stdin) = child.stdin.take() {
-                    let _ = stdin.write_all(&payload);
-                    let _ = stdin.flush();
-                }
-            }
-
-            let (tx, rx) = mpsc::channel();
-            let mut drains = Vec::new();
-            if let Some(stdout) = child.stdout.take() {
-                drains.push(spawn_drain(stdout, tx.clone(), DrainKind::Stdout));
-            }
-            if let Some(stderr) = child.stderr.take() {
-                drains.push(spawn_drain(stderr, tx.clone(), DrainKind::Stderr));
-            }
-            drop(tx);
-
-            let mut stdout = Vec::new();
-            let mut stderr = Vec::new();
-            let status = loop {
-                drain_available_events(&rx, &mut stream, &mut stdout, &mut stderr);
-                match child.try_wait() {
-                    Ok(Some(status)) => break process_status_from_output(&status),
-                    Ok(None) => match rx.recv_timeout(Duration::from_millis(50)) {
-                        Ok(event) => drain_one_event(event, &mut stream, &mut stdout, &mut stderr),
-                        Err(mpsc::RecvTimeoutError::Timeout) => {}
-                        Err(mpsc::RecvTimeoutError::Disconnected) => {}
-                    },
-                    Err(err) => {
-                        break ProcessStatus::SpawnError {
-                            reason: format!("Failed to supervise Claude provider child: {err}"),
-                        };
-                    }
-                }
-            };
-            for drain in drains {
-                let _ = drain.join();
-            }
-            drain_available_events(&rx, &mut stream, &mut stdout, &mut stderr);
-            let signal = classify_terminal_signal(&stdout, &stderr, &status, now_unix_ms());
-            stream.exit(status, signal, session);
-        }
-        Err(err) => {
-            let status = ProcessStatus::SpawnError {
-                reason: format!("Failed to spawn Claude provider command: {err}"),
-            };
-            let signal = classify_terminal_signal(&[], &[], &status, now_unix_ms());
-            stream.exit(status, signal, session);
-        }
-    }
-
-    Ok(())
-}
-
-#[derive(Clone, Copy)]
-enum DrainKind {
-    Stdout,
-    Stderr,
-}
-
-fn spawn_drain<R: Read + Send + 'static>(
-    mut reader: R,
-    tx: mpsc::Sender<DrainEvent>,
-    kind: DrainKind,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        let mut buffer = [0u8; 16 * 1024];
-        loop {
-            match reader.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(count) => {
-                    let chunk = buffer[..count].to_vec();
-                    let event = match kind {
-                        DrainKind::Stdout => DrainEvent::Stdout(chunk),
-                        DrainKind::Stderr => DrainEvent::Stderr(chunk),
-                    };
-                    if tx.send(event).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    })
-}
-
-fn drain_available_events<W: Write>(
-    rx: &mpsc::Receiver<DrainEvent>,
-    stream: &mut LaunchStream<'_, W>,
-    stdout: &mut Vec<u8>,
-    stderr: &mut Vec<u8>,
-) {
-    while let Ok(event) = rx.try_recv() {
-        drain_one_event(event, stream, stdout, stderr);
-    }
-}
-
-fn drain_one_event<W: Write>(
-    event: DrainEvent,
-    stream: &mut LaunchStream<'_, W>,
-    stdout: &mut Vec<u8>,
-    stderr: &mut Vec<u8>,
-) {
-    match event {
-        DrainEvent::Stdout(bytes) => {
-            stream.bytes("stdout", &bytes);
-            stdout.extend(bytes);
-        }
-        DrainEvent::Stderr(bytes) => {
-            stream.bytes("stderr", &bytes);
-            stderr.extend(bytes);
-        }
-    }
 }
 
 fn success_response(request_id: &str, result: Value) -> Value {
@@ -3217,74 +3015,6 @@ fn terminal_signal_kind_str(kind: TerminalSignalKind) -> &'static str {
 
 fn bounded_text(text: &str, max_len: usize) -> String {
     text.chars().take(max_len).collect()
-}
-
-struct LaunchStream<'a, W: Write> {
-    request_id: &'a str,
-    writer: &'a mut W,
-    seq: u64,
-}
-
-impl<'a, W: Write> LaunchStream<'a, W> {
-    fn new(request_id: &'a str, writer: &'a mut W) -> Self {
-        Self {
-            request_id,
-            writer,
-            seq: 0,
-        }
-    }
-
-    fn bytes(&mut self, kind: &str, bytes: &[u8]) {
-        self.seq += 1;
-        self.write_event(json!({
-            "contract": CONTRACT,
-            "request_id": self.request_id,
-            "seq": self.seq,
-            "time_unix_ms": now_unix_ms(),
-            "kind": kind,
-            "data_base64": encode_base64(bytes),
-        }));
-    }
-
-    fn marker(&mut self, name: &str) {
-        self.seq += 1;
-        self.write_event(json!({
-            "contract": CONTRACT,
-            "request_id": self.request_id,
-            "seq": self.seq,
-            "time_unix_ms": now_unix_ms(),
-            "kind": "marker",
-            "name": name,
-            "value": true,
-        }));
-    }
-
-    fn exit(
-        &mut self,
-        status: ProcessStatus,
-        terminal_signal: TerminalSignal,
-        session: Option<Value>,
-    ) {
-        self.seq += 1;
-        let mut event = json!({
-            "contract": CONTRACT,
-            "request_id": self.request_id,
-            "seq": self.seq,
-            "time_unix_ms": now_unix_ms(),
-            "kind": "exit",
-            "status": status,
-            "terminal_signal": terminal_signal_json(&terminal_signal),
-        });
-        if let Some(session) = session {
-            event["session"] = session;
-        }
-        self.write_event(event);
-    }
-
-    fn write_event(&mut self, event: Value) {
-        let _ = writeln!(self.writer, "{event}");
-        let _ = self.writer.flush();
-    }
 }
 
 fn now_unix_ms() -> u64 {
