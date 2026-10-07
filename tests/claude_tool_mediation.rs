@@ -36,7 +36,7 @@ while i < len(args):
         opts[args[i]] = args[i + 1]; i += 2
     else:
         i += 1
-record = {'argv': args, 'opts': opts, 'tool_search': os.environ.get('ENABLE_TOOL_SEARCH'), 'pid': os.getpid()}
+record = {'argv': args, 'opts': opts, 'tool_search': os.environ.get('ENABLE_TOOL_SEARCH'), 'pid': os.getpid(), 'offer_in_native_env': 'OULIPOLY_EXPLORATION_V1' in os.environ}
 session = opts.get('--resume', opts.get('--session-id'))
 def emit(event):
     print(json.dumps(event), flush=True)
@@ -49,16 +49,25 @@ if prompt.startswith('inventory '):
     elif case == 'extra-server': init['mcp_servers'].append({'name':'foreign','status':'connected'})
     elif case == 'disconnected': init['mcp_servers'][0]['status'] = 'failed'
     elif case == 'invalid': init['tools'] = None
+    elif case == 'no-explore': init['tools'] = [t for t in init['tools'] if t != 'mcp__oulipoly__explore']
 emit(init)
 emit({'type': 'user', 'uuid': message['uuid'], 'session_id': session, 'parent_tool_use_id': None, 'message': message['message']})
 said = 'no tool'
 words = prompt.split(' ', 1)
-if words[0] == 'bash':
+if words[0] == 'explore' and 'mcp__oulipoly__explore' not in opts.get('--allowedTools', '').split(','):
+    said = 'explore is not an allowed tool'
+    servers = json.loads(opts.get('--mcp-config', '{"mcpServers":{}}'))['mcpServers']
+    record['servers'] = list(servers)
+    record['offer_in_mcp_config'] = any('OULIPOLY_EXPLORATION_V1' in s.get('env', {}) for s in servers.values())
+    with open(os.environ['CALLS'], 'a') as f:
+        f.write(json.dumps(record) + '\n')
+elif words[0] in ('bash', 'explore'):
     servers = json.loads(opts['--mcp-config'])['mcpServers']
     record['servers'] = list(servers)
     server = servers['oulipoly']
     env = {'PATH': os.environ.get('PATH', ''), 'HOME': os.environ.get('HOME', '')}
     env.update(server.get('env', {}))
+    record['offer_in_mcp_config'] = 'OULIPOLY_EXPLORATION_V1' in server.get('env', {})
     mcp = subprocess.Popen([server['command']] + server['args'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env, text=True)
     def rpc(id, method, params=None):
         mcp.stdin.write(json.dumps({'jsonrpc': '2.0', 'id': id, 'method': method, 'params': params or {}}) + '\n'); mcp.stdin.flush()
@@ -68,7 +77,14 @@ if words[0] == 'bash':
     record['mcp_pid'] = mcp.pid
     with open(os.environ['CALLS'], 'a') as f:
         f.write(json.dumps(record) + '\n')
-    result = rpc(3, 'tools/call', {'name': 'bash', 'arguments': {'command': words[1]}})['result']
+    if words[0] == 'bash':
+        result = rpc(3, 'tools/call', {'name': 'bash', 'arguments': {'command': words[1]}})['result']
+    else:
+        route, question = words[1].split(' ', 1)
+        arguments = {'question': question}
+        if route != '-':
+            arguments['route'] = route
+        result = rpc(3, 'tools/call', {'name': 'explore', 'arguments': arguments})['result']
     record['is_error'] = result['isError']
     said = result['content'][0]['text']
     mcp.stdin.close(); mcp.wait()
@@ -103,6 +119,23 @@ elif end['event'] == 'refused':
     print(json.dumps({'result_surface': 'agent-bash-root-v1', 'version': 1, 'delivery_mode': 'sync', 'outcome': 'refused', 'effects_possible': False, 'refusal': {'by': 'owner', 'reason': end['reason']}, 'stages': stages, 'faults': [], 'wait': None, 'output': {'base64': '', 'bytes': 0, 'delivery': 'none'}}))
 else:
     print(json.dumps({'result_surface': 'agent-bash-root-v1', 'version': 1, 'delivery_mode': 'sync', 'outcome': 'ended', 'effects_possible': True, 'stages': stages, 'faults': [], 'wait': {'status': end['status'], 'observer': 'work-pid1-wait', 'exit': {'code': int(end['status'].split(':')[1])}}, 'output': {'base64': base64.b64encode(out).decode(), 'bytes': len(out), 'delivery': 'complete'}}))
+"#;
+
+/// Child requester stand-in (root-child v1 requester surface, reduced):
+/// `REQUESTER ROUTE QUESTION` asks the owner named by its ingress for one
+/// child, relays the owner's stages on stderr and prints its final object.
+const CHILD_REQUESTER: &str = r#"#!/usr/bin/env python3
+import json, os, socket, sys
+route, question = sys.argv[1:]
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(os.environ['OULIPOLY_ROOT_BASH_V1'])
+s.sendall((json.dumps({'v': 1, 'op': 'child', 'route': route, 'prompt': question, 'cwd': os.getcwd()}) + '\n').encode())
+for line in s.makefile('rb'):
+    event = json.loads(line)
+    if event['event'] == 'result':
+        print(json.dumps(event)); sys.exit(0)
+    print('%s: %s' % (event['event'], json.dumps(event)), file=sys.stderr, flush=True)
+print(json.dumps({'event': 'lost'})); sys.exit(75)
 "#;
 
 /// One request the stand-in ingress received.
@@ -175,6 +208,24 @@ impl Ingress {
                     let mut say = |event: Value| {
                         let _ = writeln!(stream, "{event}");
                     };
+                    if request["op"] == json!("child") {
+                        let child = format!("child-{}", index + 1);
+                        say(json!({"event":"accepted","child":child,"durable":true}));
+                        if request["prompt"] == json!("hang") {
+                            let mut rest = String::new();
+                            let _ = reader.read_line(&mut rest);
+                            record.lock().unwrap()[index].eof_while_running = true;
+                            return;
+                        }
+                        say(
+                            json!({"event":"result","child":child,"route":request["route"],
+                            "outcome":"answered","answer":format!("answer to {}", request["prompt"].as_str().unwrap()),
+                            "turn_end":{"stop_reason":"end_turn"},"stopped":null,"launch":null,
+                            "end":{"event":"end","status":"code:0","observer":"work-pid1-wait","namespace":{"drained":true}},
+                            "lifecycle":{"end":"observed","bash_runs_open":0,"bash_run_end_unknown":false,"budget":"released"}}),
+                        );
+                        return;
+                    }
                     say(
                         json!({"event":"accepted","root_id":"stand-in","work":index + 1,"durable":true}),
                     );
@@ -237,7 +288,11 @@ impl Fixture {
             .prefix("u94-correction-claude-mediation-")
             .tempdir_in("/tmp")
             .unwrap();
-        for (name, text) in [("claude", FAKE_CLAUDE), ("requester", REQUESTER)] {
+        for (name, text) in [
+            ("claude", FAKE_CLAUDE),
+            ("requester", REQUESTER),
+            ("child-requester", CHILD_REQUESTER),
+        ] {
             let path = root.path().join(name);
             std::fs::write(&path, text).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -254,6 +309,40 @@ impl Fixture {
         json!({"protocol":"oulipoly.tool_mediation/v1","bash":bash,
             "requester":self.path().join("requester"),"ingress_env":INGRESS_ENV})
         .to_string()
+    }
+
+    fn offer(&self, routes: &[&str]) -> String {
+        json!({"protocol":"oulipoly.exploration/v1","routes":routes,
+            "requester":self.path().join("child-requester"),"ingress_env":INGRESS_ENV,
+            "limits":{"max_starts":4}})
+        .to_string()
+    }
+
+    /// A host that also selects exploration/v1.
+    fn exploring_host(&self) -> Value {
+        let mut host = self.host();
+        host["env"]["OULIPOLY_HOST_EXPLORATION_V1"] = json!("1");
+        host
+    }
+
+    /// A mediated template, with `offer` beside the policy when given.
+    fn offered(&self, offer: Option<String>) -> Value {
+        let mut template = self.template(&[], Some(self.policy(json!({"allow":["true"]}))));
+        if let Some(offer) = offer {
+            template["env"]["OULIPOLY_EXPLORATION_V1"] = json!(offer);
+        }
+        template
+    }
+
+    fn evaluate(&self, host: Value, env: Value) -> Value {
+        self.invoke(
+            "policy.evaluate",
+            host,
+            json!({"settings_id":"claude-primary","mode":"headless",
+                "model":{"name":"opus","provider_args":[],"inputs":{"prompt":"hi","named":{}}},
+                "launch":{"command":"claude","env":env}}),
+        )["result"]
+            .clone()
     }
 
     fn host(&self) -> Value {
@@ -299,9 +388,13 @@ impl Fixture {
     }
 
     fn prepare(&self, template: Value) -> Value {
+        self.prepare_for(self.host(), template)
+    }
+
+    fn prepare_for(&self, host: Value, template: Value) -> Value {
         self.invoke(
             "resident.prepare",
-            self.host(),
+            host,
             json!({"protocol":"oulipoly.resident_session/v1","launch":template}),
         )
     }
@@ -325,11 +418,18 @@ struct Client {
 
 impl Client {
     fn serve(prepared: &Value, ingress: Option<&Path>) -> Self {
+        Self::serve_with(prepared, ingress, &[])
+    }
+
+    /// Serves with `inherited` in the endpoint's own process environment.
+    fn serve_with(prepared: &Value, ingress: Option<&Path>, inherited: &[(&str, &str)]) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agent-runner-claude"));
         for arg in prepared["invocation"]["args"].as_array().unwrap() {
             command.arg(arg.as_str().unwrap());
         }
         command.env_remove(INGRESS_ENV);
+        command.env_remove("OULIPOLY_EXPLORATION_V1");
+        command.envs(inherited.iter().copied());
         if let Some(ingress) = ingress {
             command.env(INGRESS_ENV, ingress);
         }
@@ -750,5 +850,258 @@ fn native_inventory_reports_are_observed_and_contradictions_refuse_the_turn() {
             "{case}: {observation}"
         );
         assert!(ingress.seen().is_empty());
+    }
+}
+
+fn marker(result: &Value, name: &str) -> Option<Value> {
+    result["markers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["name"] == json!(name))
+        .map(|m| m["value"].clone())
+}
+
+#[test]
+fn exploration_is_advertised_only_to_a_host_that_selects_it() {
+    let f = Fixture::new();
+    let selected = f.invoke("describe", f.exploring_host(), json!({}));
+    assert_eq!(
+        selected["result"]["capabilities"]["exploration_v1"],
+        json!(true),
+        "{selected}"
+    );
+    for host in [f.host(), json!({"app":"t"})] {
+        let described = f.invoke("describe", host, json!({}));
+        assert!(
+            described["result"]["capabilities"]
+                .get("exploration_v1")
+                .is_none(),
+            "{described}"
+        );
+    }
+}
+
+#[test]
+fn policy_reports_one_explore_tool_only_for_an_admitted_offer() {
+    let f = Fixture::new();
+    let policy = f.policy(json!({"authority":"trusted-task"}));
+    let offer = f.offer(&["luna-max", "terra"]);
+    let result = f.evaluate(
+        f.exploring_host(),
+        json!({"OULIPOLY_TOOL_MEDIATION_V1":policy,"OULIPOLY_EXPLORATION_V1":offer}),
+    );
+    assert_eq!(result["accepted"], json!(true), "{result}");
+    assert_eq!(result["env"]["OULIPOLY_EXPLORATION_V1"], json!(offer));
+    let effective = marker(&result, "oulipoly.exploration/v1").expect("exploration marker");
+    agent_provider_contract::exploration::validate("EffectiveExploration", &effective).unwrap();
+    assert_eq!(effective["routes"], json!(["luna-max", "terra"]));
+    assert_eq!(effective["ingress_env"], json!(INGRESS_ENV));
+    let mediation = marker(&result, "oulipoly.tool_mediation/v1").expect("mediation marker");
+    let tools: Vec<&Value> = mediation["native_tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .collect();
+    // trusted-task's file tools, the mediated command tool, and exactly one
+    // more: the exploration tool the exploration marker names.
+    assert_eq!(tools.len(), 5, "{mediation}");
+    assert!(tools.contains(&&mediation["tool"]));
+    assert!(
+        tools.contains(&&effective["tool"]),
+        "{mediation} {effective}"
+    );
+    for builtin in ["Read", "Write", "Edit"] {
+        assert!(tools.contains(&&json!(builtin)), "{mediation}");
+    }
+
+    let result = f.evaluate(
+        f.exploring_host(),
+        json!({"OULIPOLY_TOOL_MEDIATION_V1":policy}),
+    );
+    assert_eq!(result["accepted"], json!(true), "{result}");
+    assert!(marker(&result, "oulipoly.exploration/v1").is_none());
+    assert_eq!(
+        marker(&result, "oulipoly.tool_mediation/v1").unwrap()["native_tools"],
+        json!(["mcp__oulipoly__bash", "Read", "Write", "Edit"])
+    );
+
+    let mut unmediated_host = f.exploring_host();
+    unmediated_host["env"]
+        .as_object_mut()
+        .unwrap()
+        .remove("OULIPOLY_HOST_TOOL_MEDIATION_V1");
+    let mut unknown_field: Value = serde_json::from_str(&offer).unwrap();
+    unknown_field["model"] = json!("opus");
+    for (host, env) in [
+        (
+            f.host(),
+            json!({"OULIPOLY_TOOL_MEDIATION_V1":policy,"OULIPOLY_EXPLORATION_V1":offer}),
+        ),
+        (unmediated_host, json!({"OULIPOLY_EXPLORATION_V1":offer})),
+        (
+            f.exploring_host(),
+            json!({"OULIPOLY_TOOL_MEDIATION_V1":policy,"OULIPOLY_EXPLORATION_V1":unknown_field.to_string()}),
+        ),
+        (
+            f.exploring_host(),
+            json!({"OULIPOLY_TOOL_MEDIATION_V1":policy,"OULIPOLY_EXPLORATION_V1":"[]"}),
+        ),
+    ] {
+        let result = f.evaluate(host.clone(), env.clone());
+        assert_eq!(result["accepted"], json!(false), "{env} {result}");
+        assert!(marker(&result, "oulipoly.exploration/v1").is_none());
+        assert!(
+            result["diagnostics"]
+                .to_string()
+                .to_lowercase()
+                .contains("exploration"),
+            "refused for the offer: {result}"
+        );
+        let mut template = f.template(&[], None);
+        template["env"] = env.clone();
+        let response = f.prepare_for(host, template);
+        assert_eq!(response["ok"], json!(false), "{env} {response}");
+        assert!(
+            response["error"]
+                .to_string()
+                .to_lowercase()
+                .contains("exploration"),
+            "{response}"
+        );
+    }
+    // A one-shot launch is never mediated, so an offer is refused there too.
+    let launched = f.path().join("launched");
+    let mut host = f.exploring_host();
+    host["env"]["OULIPOLY_HOST_LAUNCH_OUTPUT_V1"] = json!("1");
+    host["env"]
+        .as_object_mut()
+        .unwrap()
+        .remove("OULIPOLY_HOST_TOOL_MEDIATION_V1");
+    let launch = f.invoke(
+        "launch",
+        host,
+        json!({"settings_id":"claude-primary","mode":"headless",
+            "model":{"name":"opus","provider_args":[],"inputs":{"prompt":null,"named":{}}},
+            "argv":["/bin/sh","-c",format!("touch {}", launched.display())],
+            "working_directory":f.path(),"env":{"OULIPOLY_EXPLORATION_V1":offer}}),
+    );
+    assert_eq!(launch["ok"], json!(false), "{launch}");
+    assert!(!launched.exists(), "nothing ran");
+    assert!(f.calls().is_empty());
+}
+
+#[test]
+fn an_offered_parent_asks_the_owner_through_one_explore_tool_and_keeps_bash() {
+    let f = Fixture::new();
+    let ingress = Ingress::start(f.path());
+    let prepared = f.prepare_for(f.exploring_host(), f.offered(Some(f.offer(&["luna-max"]))));
+    assert_eq!(prepared["ok"], json!(true), "{prepared}");
+    let mut client = Client::serve(&prepared["result"], Some(&ingress.path));
+    let work = f.path().join("work");
+    let session = client.open(&work);
+    let said = client.said(&session, "explore - where is the bridge wired?");
+    assert!(
+        said.contains("Explorer child-1 (route luna-max): answered."),
+        "{said}"
+    );
+    assert!(
+        said.contains("answer to where is the bridge wired?"),
+        "{said}"
+    );
+    let call = f.calls().pop().unwrap();
+    assert_eq!(call["tools"], json!(["bash", "explore"]));
+    assert_eq!(call["servers"], json!(["oulipoly"]));
+    assert_eq!(call["offer_in_mcp_config"], json!(true));
+    let allowed: Vec<&str> = call["opts"]["--allowedTools"]
+        .as_str()
+        .unwrap()
+        .split(',')
+        .collect();
+    assert_eq!(allowed, ["mcp__oulipoly__bash", "mcp__oulipoly__explore"]);
+    assert_eq!(call["opts"]["--tools"], json!(""));
+    let seen = ingress.seen();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].request["op"], json!("child"));
+    assert_eq!(seen[0].request["route"], json!("luna-max"));
+    assert!(
+        seen[0].ancestry.contains(&(client.child.id() as i32)),
+        "the child requester runs inside the endpoint's own process tree: {:?}",
+        seen[0].ancestry
+    );
+    let said = client.said(&session, "explore terra anything");
+    assert!(said.contains("Nothing was asked"), "{said}");
+    assert_eq!(ingress.seen().len(), 1);
+    let said = client.said(&session, "bash true");
+    assert!(said.contains("ran true"), "{said}");
+    assert_eq!(ingress.seen().len(), 2);
+    // A native report that leaves out the offered tool contradicts it.
+    let id = client.prompt(&session, "inventory no-explore");
+    let response = client.response(id);
+    assert!(
+        response
+            .to_string()
+            .contains("native_tool_inventory_mismatch"),
+        "{response}"
+    );
+}
+
+#[test]
+fn an_offer_that_was_not_admitted_never_reaches_claude_or_its_bridge() {
+    let f = Fixture::new();
+    let ingress = Ingress::start(f.path());
+    let offer = f.offer(&["luna-max"]);
+    let prepared = f.prepare_for(f.exploring_host(), f.offered(None));
+    assert_eq!(prepared["ok"], json!(true), "{prepared}");
+    let mut client = Client::serve_with(
+        &prepared["result"],
+        Some(&ingress.path),
+        &[("OULIPOLY_EXPLORATION_V1", offer.as_str())],
+    );
+    let session = client.open(&f.path().join("work"));
+    let said = client.said(&session, "explore - where?");
+    assert_eq!(said, "explore is not an allowed tool");
+    let call = f.calls().pop().unwrap();
+    assert_eq!(call["offer_in_mcp_config"], json!(false), "{call}");
+    assert_eq!(call["offer_in_native_env"], json!(false), "{call}");
+    let said = client.said(&session, "bash true");
+    assert!(said.contains("ran true"), "{said}");
+    let call = f.calls().pop().unwrap();
+    assert_eq!(call["tools"], json!(["bash"]), "{call}");
+    assert!(ingress
+        .seen()
+        .iter()
+        .all(|seen| seen.request["op"] != json!("child")));
+}
+
+#[test]
+fn cancelling_an_explore_turn_ends_its_requester_and_bridge() {
+    let f = Fixture::new();
+    let ingress = Ingress::start(f.path());
+    let prepared = f.prepare_for(f.exploring_host(), f.offered(Some(f.offer(&["luna-max"]))));
+    let mut client = Client::serve(&prepared["result"], Some(&ingress.path));
+    let session = client.open(&f.path().join("work"));
+    let id = client.prompt(&session, "explore luna-max hang");
+    client.response(id);
+    let deadline = Instant::now() + TIMEOUT;
+    while ingress.seen().is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "the request never reached the ingress"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let requester = ingress.seen()[0].peer;
+    let bridge = f.calls().pop().unwrap()["mcp_pid"].as_i64().unwrap();
+    assert!(alive(requester.into()) && alive(bridge));
+    client.notify("session/cancel", json!({"sessionId":session}));
+    let idle = client.update("cancelled idle", |u| u["state"] == json!("idle"));
+    assert_eq!(idle["stopReason"], json!("cancelled"), "{idle}");
+    while alive(requester.into()) || alive(bridge) || !ingress.seen()[0].eof_while_running {
+        assert!(
+            Instant::now() < deadline,
+            "requester or bridge survived cancel"
+        );
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
