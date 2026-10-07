@@ -30,7 +30,7 @@
 
 use agent_provider_contract::tool_mediation::{EffectiveMediation, ToolMediation};
 use agent_provider_execution::tool_bridge;
-use serde_json::json;
+use serde_json::{json, Value};
 
 /// The MCP server name; Claude Code names its tool `mcp__<server>__<tool>`.
 pub(crate) const SERVER: &str = "oulipoly";
@@ -141,3 +141,57 @@ pub(crate) fn native_args(policy: &ToolMediation, bridge: &str, ingress: &str) -
 
 /// Claude Code environment entries mediation sets.
 pub(crate) const NATIVE_ENV: &[(&str, &str)] = &[("ENABLE_TOOL_SEARCH", "false")];
+
+/// Native inventory is a report, not enforcement attestation. Missing fields
+/// remain explicitly unreported; present contradictory or invalid fields fail
+/// the turn. Keep the actual report with the expected configuration in the
+/// durable native-turn journal for qualification.
+pub(crate) fn inventory(policy: &ToolMediation, init: &Value) -> (Value, bool) {
+    let expected = native_tools(policy);
+    let tools = match init.get("tools") {
+        None => "not-reported",
+        Some(Value::Array(tools))
+            if tools.len() == expected.len()
+                && tools.iter().all(|tool| {
+                    tool.as_str()
+                        .is_some_and(|tool| expected.iter().any(|e| e == tool))
+                })
+                && expected
+                    .iter()
+                    .all(|tool| tools.iter().filter(|t| t.as_str() == Some(tool)).count() == 1) =>
+        {
+            "consistent"
+        }
+        Some(Value::Array(tools)) if tools.iter().all(Value::is_string) => "contradictory",
+        Some(_) => "invalid",
+    };
+    let servers = match init.get("mcp_servers") {
+        None => "not-reported",
+        Some(Value::Array(servers))
+            if servers.len() == 1
+                && servers[0]["name"] == json!(SERVER)
+                && servers[0]["status"] == json!("connected") =>
+        {
+            "consistent"
+        }
+        Some(Value::Array(servers))
+            if servers
+                .iter()
+                .all(|s| s["name"].is_string() && s["status"].is_string()) =>
+        {
+            "contradictory"
+        }
+        Some(_) => "invalid",
+    };
+    let contradiction = [tools, servers]
+        .iter()
+        .any(|s| matches!(*s, "contradictory" | "invalid"));
+    (
+        json!({"source":"claude.stream_json.init", "tools_observation":tools,
+        "mcp_observation":servers, "expected_tools":expected,
+        "expected_mcp_servers":[{"name":SERVER,"status":"connected"}],
+        "reported_tools":init.get("tools"), "reported_mcp_servers":init.get("mcp_servers"),
+        "enforcement_attested":false}),
+        contradiction,
+    )
+}

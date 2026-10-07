@@ -40,7 +40,16 @@ record = {'argv': args, 'opts': opts, 'tool_search': os.environ.get('ENABLE_TOOL
 session = opts.get('--resume', opts.get('--session-id'))
 def emit(event):
     print(json.dumps(event), flush=True)
-emit({'type': 'system', 'subtype': 'init', 'session_id': session})
+init = {'type': 'system', 'subtype': 'init', 'session_id': session}
+if prompt.startswith('inventory '):
+    init.update(tools=opts['--allowedTools'].split(','), mcp_servers=[{'name':'oulipoly','status':'connected'}])
+    case = prompt.split(' ', 1)[1]
+    if case == 'extra-tool': init['tools'].append('Bash')
+    elif case == 'missing-tool': init['tools'] = []
+    elif case == 'extra-server': init['mcp_servers'].append({'name':'foreign','status':'connected'})
+    elif case == 'disconnected': init['mcp_servers'][0]['status'] = 'failed'
+    elif case == 'invalid': init['tools'] = None
+emit(init)
 emit({'type': 'user', 'uuid': message['uuid'], 'session_id': session, 'parent_tool_use_id': None, 'message': message['message']})
 said = 'no tool'
 words = prompt.split(' ', 1)
@@ -225,7 +234,7 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let root = tempfile::Builder::new()
-            .prefix("u94-claude-mediation-")
+            .prefix("u94-correction-claude-mediation-")
             .tempdir_in("/tmp")
             .unwrap();
         for (name, text) in [("claude", FAKE_CLAUDE), ("requester", REQUESTER)] {
@@ -667,5 +676,79 @@ fn cancelling_a_turn_ends_the_bridge_and_requester_in_its_group() {
             "requester or bridge survived cancel"
         );
         std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn native_inventory_reports_are_observed_and_contradictions_refuse_the_turn() {
+    for case in [
+        "consistent",
+        "extra-tool",
+        "missing-tool",
+        "extra-server",
+        "disconnected",
+        "invalid",
+        "unreported",
+    ] {
+        let f = Fixture::new();
+        let prepared = f.prepare(f.template(&[], Some(f.policy(json!({"allow":["true"]})))));
+        let ingress = Ingress::start(f.path());
+        let mut client = Client::serve(&prepared["result"], Some(&ingress.path));
+        let session = client.open(&f.path().join("work"));
+        if case == "consistent" || case == "unreported" {
+            let prompt = if case == "unreported" {
+                "no tool".into()
+            } else {
+                format!("inventory {case}")
+            };
+            assert_eq!(client.said(&session, &prompt), "no tool");
+            client.update("complete idle", |u| {
+                u["sessionUpdate"] == json!("state_update") && u["state"] == json!("idle")
+            });
+        } else {
+            let id = client.prompt(&session, &format!("inventory {case}"));
+            let response = client.response(id);
+            assert!(
+                response["error"].is_object()
+                    && response
+                        .to_string()
+                        .contains("native_tool_inventory_mismatch"),
+                "{case}: {response}"
+            );
+        }
+        // The SDK retains the actual init observation in the native-turn journal;
+        // arbitrary markers are not fabricated as agent conversation messages.
+        let mut journals = Vec::new();
+        fn collect(path: &Path, output: &mut Vec<String>) {
+            for entry in std::fs::read_dir(path).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    collect(&path, output);
+                } else if path.extension().is_some_and(|ext| ext == "jsonl") {
+                    output.push(std::fs::read_to_string(path).unwrap());
+                }
+            }
+        }
+        collect(&f.path().join("data"), &mut journals);
+        let observation: Value = journals
+            .iter()
+            .flat_map(|s| s.lines())
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|event| event["name"] == json!("claude.native_tool_inventory"))
+            .unwrap()["value"]
+            .clone();
+        assert_eq!(observation["enforcement_attested"], json!(false));
+        let expected = match case {
+            "unreported" => "not-reported",
+            "consistent" | "extra-server" | "disconnected" => "consistent",
+            "invalid" => "invalid",
+            _ => "contradictory",
+        };
+        assert_eq!(
+            observation["tools_observation"],
+            json!(expected),
+            "{case}: {observation}"
+        );
+        assert!(ingress.seen().is_empty());
     }
 }

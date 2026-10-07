@@ -338,6 +338,7 @@ impl ResidentTurns for ClaudeTurns {
             turn,
             argv,
             env,
+            mediation: self.mediation.as_ref(),
             user_uuid: input_uuid(&turn.request_id),
             native_session: turn
                 .native_session_id
@@ -358,6 +359,7 @@ struct ResidentTurn<'a> {
     turn: &'a TurnRequest,
     argv: Vec<String>,
     env: Value,
+    mediation: Option<&'a ToolMediation>,
     /// Identity of the submitted user message, echoed by the replay.
     user_uuid: String,
     native_session: Option<String>,
@@ -481,6 +483,14 @@ impl LaunchAdapter for ResidentTurn<'_> {
         };
         match event["type"].as_str() {
             Some("system") if event["subtype"] == json!("init") => {
+                if let Some(policy) = self.mediation {
+                    let (observation, contradiction) = crate::mediation::inventory(policy, &event);
+                    events.marker("claude.native_tool_inventory", observation.clone())?;
+                    if contradiction {
+                        return Err(launch::failure(&self.turn.request_id, "native_tool_inventory_mismatch",
+                            format!("Claude reported tool/MCP inventory inconsistent with mediation: {observation}")));
+                    }
+                }
                 let id = event["session_id"]
                     .as_str()
                     .filter(|id| valid_uuid(id))

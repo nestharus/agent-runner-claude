@@ -202,3 +202,12 @@ UUID-shaped id equal to the selected native session; drift is a turn failure.
 or `isSidechain: true` are excluded. Submitted user UUIDs have v4/variant bits.
 These assumptions have only deterministic fake qualification; the actual CLI
 echo/create/resume semantics must be checked before installed cutover.
+
+For mediated resident turns, `system/init` tool/MCP inventory is compared with the
+constructed policy. Present contradictory or malformed inventory refuses the
+turn with `native_tool_inventory_mismatch`. Every supplied init records
+`claude.native_tool_inventory` in the durable native-turn journal, including
+expected/reported facts and absent fields as `not-reported`. Consistent reports
+are observations, not enforcement attestation; missing fields permit the turn
+without attesting native efficacy. Installed Claude recognition and enforcement
+remain qualification work.
