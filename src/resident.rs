@@ -23,6 +23,7 @@ use crate::{
     classify_terminal_signal, now_unix_ms, process_status_from_output, sha256_hex,
     terminal_signal_json, HostContext, ProcessStatus, ProviderFailure, RequestEnvelope,
 };
+use agent_provider_contract::exploration::{self, Exploration};
 use agent_provider_contract::resident_session::{self, ResidentPrepareResult};
 use agent_provider_contract::tool_mediation::{self, ToolMediation};
 use agent_provider_execution::custody::RequestCustody;
@@ -223,6 +224,12 @@ pub(crate) fn prepare(request: &RequestEnvelope) -> Result<Value, ProviderFailur
             return Err(invalid(id, "tool_mediation_conflict", conflict));
         }
     }
+    crate::admit_exploration(
+        request.host.env.as_ref(),
+        params.launch.env.as_ref(),
+        mediated.as_ref(),
+    )
+    .map_err(|(code, message)| invalid(id, code, message))?;
     let mut host = serde_json::to_value(&request.host).expect("host serializes");
     // A resident endpoint outlives this request: its deadline does not apply.
     host["deadline_unix_ms"] = Value::Null;
@@ -258,6 +265,8 @@ struct ClaudeTurns {
     base_argv: Vec<String>,
     /// The host's tool mediation recorded with the template, if any.
     mediation: Option<ToolMediation>,
+    /// The host's admitted exploration offer recorded with it, if any.
+    exploration: Option<Exploration>,
 }
 
 /// This provider's own executable, as the mediated tool's MCP command. A
@@ -272,15 +281,13 @@ fn bridge_executable() -> Result<String, String> {
 
 /// The mediated turn's extra Claude Code options, or why the turn may not
 /// start: without the root's ingress in this process nothing may run.
-fn mediated_args(policy: &ToolMediation) -> Result<Vec<String>, String> {
-    let ingress = policy
-        .ingress(|name| std::env::var(name).ok())
-        .map_err(|error| error.to_string())?;
-    Ok(crate::mediation::native_args(
-        policy,
-        &bridge_executable()?,
-        &ingress,
-    ))
+fn mediated_args(
+    policy: &ToolMediation,
+    offer: Option<&Exploration>,
+) -> Result<Vec<String>, (&'static str, String)> {
+    let bridge =
+        bridge_executable().map_err(|message| ("tool_mediation_ingress_unavailable", message))?;
+    crate::mediation::native_args(policy, offer, &bridge, |name| std::env::var(name).ok())
 }
 
 impl ResidentTurns for ClaudeTurns {
@@ -321,11 +328,14 @@ impl ResidentTurns for ClaudeTurns {
         let mut argv = turn_argv(&self.base_argv, turn);
         let mut env = self.config["launch"]["env"].clone();
         if let Some(policy) = &self.mediation {
-            let extra = mediated_args(policy).map_err(|message| TurnFailure {
-                kind: TurnFailureKind::Failed,
-                code: "tool_mediation_ingress_unavailable".into(),
-                message,
-            })?;
+            let extra =
+                mediated_args(policy, self.exploration.as_ref()).map_err(|(code, message)| {
+                    TurnFailure {
+                        kind: TurnFailureKind::Failed,
+                        code: code.into(),
+                        message,
+                    }
+                })?;
             argv.extend(extra);
             if !env.is_object() {
                 env = json!({});
@@ -339,6 +349,7 @@ impl ResidentTurns for ClaudeTurns {
             argv,
             env,
             mediation: self.mediation.as_ref(),
+            exploration: self.exploration.as_ref(),
             user_uuid: input_uuid(&turn.request_id),
             native_session: turn
                 .native_session_id
@@ -360,6 +371,7 @@ struct ResidentTurn<'a> {
     argv: Vec<String>,
     env: Value,
     mediation: Option<&'a ToolMediation>,
+    exploration: Option<&'a Exploration>,
     /// Identity of the submitted user message, echoed by the replay.
     user_uuid: String,
     native_session: Option<String>,
@@ -450,6 +462,9 @@ impl LaunchAdapter for ResidentTurn<'_> {
             .expect("resident argv has a program");
         let mut command = gated_command(id, program, args)?;
         command.command_mut().current_dir(&self.turn.cwd);
+        // Only the admitted offer, which the template's environment carries,
+        // may reach Claude Code: an inherited variable is not an offer.
+        command.command_mut().env_remove(exploration::ENV);
         if let Some(env) = self.env.as_object() {
             for (key, value) in env {
                 if let Some(value) = value.as_str() {
@@ -484,7 +499,8 @@ impl LaunchAdapter for ResidentTurn<'_> {
         match event["type"].as_str() {
             Some("system") if event["subtype"] == json!("init") => {
                 if let Some(policy) = self.mediation {
-                    let (observation, contradiction) = crate::mediation::inventory(policy, &event);
+                    let (observation, contradiction) =
+                        crate::mediation::inventory(policy, self.exploration, &event);
                     events.marker("claude.native_tool_inventory", observation.clone())?;
                     if contradiction {
                         return Err(launch::failure(&self.turn.request_id, "native_tool_inventory_mismatch",
@@ -627,12 +643,21 @@ pub fn serve(args: &[String]) -> i32 {
             return 2;
         }
     };
+    let exploration =
+        match crate::admit_exploration(host.env.as_ref(), env.as_ref(), mediation.as_ref()) {
+            Ok(exploration) => exploration,
+            Err((_, message)) => {
+                eprintln!("resident configuration refused: {message}");
+                return 2;
+            }
+        };
     let stdin = std::io::BufReader::new(std::io::stdin());
     match endpoint::serve(
         Arc::new(ClaudeTurns {
             config,
             base_argv,
             mediation,
+            exploration,
         }),
         &state_root,
         stdin,

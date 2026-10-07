@@ -128,6 +128,35 @@ the server's own `env`; requester stand-in; stand-in ingress socket). Whether a
 real Claude Code release honours each constructed option remains to be
 qualified.
 
+## Child exploration (`oulipoly.exploration/v1`)
+
+`describe` advertises `exploration_v1` only when the request's `host.env`
+selected `OULIPOLY_HOST_EXPLORATION_V1=1`. A mediated resident template whose
+environment also carries the host's offer (`OULIPOLY_EXPLORATION_V1`: opaque
+route labels, the host's child requester and the name of its owner ingress
+variable) is admitted with the SDK's `exploration::admit`. Three kinds of
+offer are refused rather than ignored, by `policy.evaluate` (`accepted:
+false`), `resident.prepare` and `resident.serve`: one the request's host did
+not select, one without a tool mediation policy, and an invalid one. One-shot
+`launch` takes no mediation, so it refuses an offer too.
+
+An admitted offer adds one tool and nothing else. The `oulipoly` server's own
+`env` also carries the offer and its ingress value, so the same bridge serves
+the SDK's non-command `explore` tool beside `bash`. `--allowedTools` adds
+`mcp__oulipoly__explore`. `policy.evaluate` reports the
+`oulipoly.exploration/v1` marker with that native name, and the tool-mediation
+marker lists it in `native_tools`. The `system/init` inventory check expects
+it, so a report that omits it refuses the turn. The owner admits or refuses
+each child. A turn whose process lacks the offer's ingress variable is refused
+(`exploration_ingress_unavailable`) before Claude Code starts.
+
+Without an admitted offer, `bash` stays alone. Claude Code's own environment
+drops `OULIPOLY_EXPLORATION_V1`, so an inherited variable of that name is never
+an offer, whatever Claude Code passes to MCP servers. Coverage:
+`tests/claude_tool_mediation.rs`, with the same fakes plus a child requester
+stand-in. These fakes show the provider's configuration only, not that a real
+Claude Code offers exactly these tools, nor that a model uses `explore` well.
+
 ## Launch lifecycle
 
 `launch` runs through the shared one-shot lifecycle (`lifecycle::run_launch`)

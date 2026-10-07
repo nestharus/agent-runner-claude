@@ -401,6 +401,17 @@ fn write_invocation_result<W: Write>(
                 3,
             ));
         }
+        // An exploration offer needs mediation, so it is refused here too.
+        if let Err((code, message)) =
+            admit_exploration(request.host.env.as_ref(), Some(&params.env), None)
+        {
+            return Err(ProviderFailure::unsupported(
+                request.request_id.clone(),
+                code,
+                format!("{message}; this one-shot launch was not started"),
+                3,
+            ));
+        }
         return launch::run(&request, params, writer);
     }
 
@@ -592,13 +603,35 @@ fn policy_evaluate_response(request: RequestEnvelope) -> Result<Value, ProviderF
             } else if let Some(conflict) = mediation::conflict(&argv, resident::VALUE_FLAGS) {
                 diagnostics.push(diagnostic("error", &conflict, "tool_mediation_conflict"));
             } else {
-                markers.push(
-                    json!({"name": agent_provider_contract::tool_mediation::MARKER,
-                    "value": mediation::effective(&mediation)}),
-                );
+                match admit_exploration(
+                    request.host.env.as_ref(),
+                    Some(&policy.env),
+                    Some(&mediation),
+                ) {
+                    Err((code, message)) => {
+                        diagnostics.push(diagnostic("error", &message, code));
+                    }
+                    Ok(offer) => {
+                        markers.push(
+                            json!({"name": agent_provider_contract::tool_mediation::MARKER,
+                            "value": mediation::effective(&mediation, offer.as_ref())}),
+                        );
+                        if let Some(offer) = &offer {
+                            markers
+                                .push(json!({"name": agent_provider_contract::exploration::MARKER,
+                                "value": mediation::effective_exploration(offer)}));
+                        }
+                    }
+                }
             }
         }
-        Ok(None) => {}
+        Ok(None) => {
+            if let Err((code, message)) =
+                admit_exploration(request.host.env.as_ref(), Some(&policy.env), None)
+            {
+                diagnostics.push(diagnostic("error", &message, code));
+            }
+        }
     }
 
     let accepted = !diagnostics.iter().any(|diagnostic| {
@@ -3189,7 +3222,32 @@ pub fn describe_for(host_env: Option<&BTreeMap<String, String>>) -> Value {
         agent_provider_contract::tool_mediation::SUPPORTED_VERSIONS,
         host_env,
     );
+    agent_provider_contract::exploration::advertise(
+        capabilities,
+        agent_provider_contract::exploration::SUPPORTED_VERSIONS,
+        host_env,
+    );
     result
+}
+
+/// Admits a launch environment's `oulipoly.exploration/v1` offer, if any:
+/// one this request's host did not select, one without tool `mediation` or
+/// an invalid one is refused (a failure code and message), never ignored.
+pub(crate) fn admit_exploration(
+    host_env: Option<&BTreeMap<String, String>>,
+    launch_env: Option<&BTreeMap<String, String>>,
+    mediation: Option<&agent_provider_contract::tool_mediation::ToolMediation>,
+) -> Result<Option<agent_provider_contract::exploration::Exploration>, (&'static str, String)> {
+    use agent_provider_contract::exploration::{self, ExplorationError};
+    exploration::admit(host_env, launch_env, mediation).map_err(|error| {
+        let code = match error {
+            ExplorationError::Invalid(_) => "exploration_invalid",
+            ExplorationError::NotSelected => "exploration_not_selected",
+            ExplorationError::WithoutMediation => "exploration_without_mediation",
+            ExplorationError::NoIngress(_) => "exploration_ingress_unavailable",
+        };
+        (code, error.to_string())
+    })
 }
 
 /// Describe result for a request that selected no host extension.
