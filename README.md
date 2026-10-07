@@ -82,6 +82,39 @@ that turn's process group. The native stream-JSON behaviour is exercised here
 against a deterministic fake CLI only (`tests/claude_resident.rs`); it has not
 been qualified against a live Claude Code CLI. Never the Claude Agent SDK.
 
+## Host tool mediation (`oulipoly.tool_mediation/v1`)
+
+`describe` advertises `tool_mediation_v1` only when the request's `host.env`
+selected `OULIPOLY_HOST_TOOL_MEDIATION_V1=1`. A resident template whose
+environment carries the host's policy (`OULIPOLY_TOOL_MEDIATION_V1`: a Bash allow
+list or `trusted-task`, the host's requester and the name of its Bash ingress
+variable) makes the SDK's mediated `bash` tool Claude Code's only command tool on
+every turn: `--strict-mcp-config --mcp-config` with one server, `oulipoly`
+(this provider executable's `tool.bridge` subcommand, with the policy and the
+ingress value in its own `env`), so its tool is `mcp__oulipoly__bash`;
+`--tools ""` (allow list) or `--tools Read,Write,Edit` (`trusted-task`, the
+embedded receiver's meaning); `--allowedTools` naming exactly those tools;
+`--disallowedTools` naming built-in `Bash`, delegation, background, web, notebook
+and skill tools; `--permission-mode dontAsk`; `--setting-sources ""`;
+`--disable-slash-commands`; and `ENABLE_TOOL_SEARCH=false`. The bridge refuses a
+command outside an allow list and starts no requester; otherwise it runs only
+`requester run --delivery sync|async -- bash -lc COMMAND`, so the command reaches
+the root's own Bash ingress.
+
+`policy.evaluate` admits the policy strictly and reports it as an
+`oulipoly.tool_mediation/v1` marker; an invalid policy, a host selection
+without one, `tool_restrictions`, or a template carrying its own tool,
+permission, settings, agent, plugin, directory or MCP options is
+`accepted: false`, and `resident.prepare` refuses the same. A turn whose
+serving process lacks the named ingress variable is refused
+(`tool_mediation_ingress_unavailable`) before Claude Code starts. One-shot
+`launch` does not apply mediation and refuses a policy
+(`tool_mediation_resident_only`). Coverage: `tests/claude_tool_mediation.rs`
+(fake Claude Code starting the configured MCP server with only PATH, HOME and
+the server's own `env`; requester stand-in; stand-in ingress socket). Whether a
+real Claude Code release honours each constructed option remains to be
+qualified.
+
 ## Launch lifecycle
 
 `launch` runs through the shared one-shot lifecycle (`lifecycle::run_launch`)

@@ -24,6 +24,7 @@ use crate::{
     terminal_signal_json, HostContext, ProcessStatus, ProviderFailure, RequestEnvelope,
 };
 use agent_provider_contract::resident_session::{self, ResidentPrepareResult};
+use agent_provider_contract::tool_mediation::{self, ToolMediation};
 use agent_provider_execution::custody::RequestCustody;
 use agent_provider_execution::encoding::canonical_json_bytes;
 use agent_provider_execution::lifecycle::{
@@ -91,7 +92,7 @@ fn resident_root(host: &HostContext) -> Result<PathBuf, ProviderFailure> {
 // Value-bearing native options admitted by the policy boundary. Consume their
 // next token as data even when it spells a resident-owned flag. Unknown options
 // are refused because their arity cannot safely be inferred from the next token.
-const VALUE_FLAGS: &[&str] = &[
+pub(crate) const VALUE_FLAGS: &[&str] = &[
     "--append-system-prompt",
     "--append-system-prompt-file",
     "--system-prompt",
@@ -214,6 +215,14 @@ pub(crate) fn prepare(request: &RequestEnvelope) -> Result<Value, ProviderFailur
         .map_err(|error| invalid(id, "invalid_resident_prepare", error.to_string()))?;
     base_argv(&params.launch.argv)
         .map_err(|message| invalid(id, "invalid_resident_argv", message))?;
+    let mediated =
+        tool_mediation::required_by_host(request.host.env.as_ref(), params.launch.env.as_ref())
+            .map_err(|error| invalid(id, "tool_mediation_invalid", error.to_string()))?;
+    if mediated.is_some() {
+        if let Some(conflict) = crate::mediation::conflict(&params.launch.argv, VALUE_FLAGS) {
+            return Err(invalid(id, "tool_mediation_conflict", conflict));
+        }
+    }
     let mut host = serde_json::to_value(&request.host).expect("host serializes");
     // A resident endpoint outlives this request: its deadline does not apply.
     host["deadline_unix_ms"] = Value::Null;
@@ -247,6 +256,31 @@ pub(crate) fn prepare(request: &RequestEnvelope) -> Result<Value, ProviderFailur
 struct ClaudeTurns {
     config: Value,
     base_argv: Vec<String>,
+    /// The host's tool mediation recorded with the template, if any.
+    mediation: Option<ToolMediation>,
+}
+
+/// This provider's own executable, as the mediated tool's MCP command. A
+/// replaced file at the same path is the compatible replacement that serves.
+fn bridge_executable() -> Result<String, String> {
+    let exe = std::env::current_exe().map_err(|error| error.to_string())?;
+    let exe = exe
+        .to_str()
+        .ok_or("provider executable path is not UTF-8")?;
+    Ok(exe.strip_suffix(" (deleted)").unwrap_or(exe).to_owned())
+}
+
+/// The mediated turn's extra Claude Code options, or why the turn may not
+/// start: without the root's ingress in this process nothing may run.
+fn mediated_args(policy: &ToolMediation) -> Result<Vec<String>, String> {
+    let ingress = policy
+        .ingress(|name| std::env::var(name).ok())
+        .map_err(|error| error.to_string())?;
+    Ok(crate::mediation::native_args(
+        policy,
+        &bridge_executable()?,
+        &ingress,
+    ))
 }
 
 impl ResidentTurns for ClaudeTurns {
@@ -284,10 +318,26 @@ impl ResidentTurns for ClaudeTurns {
             state_root: &turn.state_root,
             timing: LifecycleTiming::default(),
         };
+        let mut argv = turn_argv(&self.base_argv, turn);
+        let mut env = self.config["launch"]["env"].clone();
+        if let Some(policy) = &self.mediation {
+            let extra = mediated_args(policy).map_err(|message| TurnFailure {
+                kind: TurnFailureKind::Failed,
+                code: "tool_mediation_ingress_unavailable".into(),
+                message,
+            })?;
+            argv.extend(extra);
+            if !env.is_object() {
+                env = json!({});
+            }
+            for (key, value) in crate::mediation::NATIVE_ENV {
+                env[*key] = json!(value);
+            }
+        }
         let mut adapter = ResidentTurn {
             turn,
-            argv: turn_argv(&self.base_argv, turn),
-            env: self.config["launch"]["env"].clone(),
+            argv,
+            env,
             user_uuid: input_uuid(&turn.request_id),
             native_session: turn
                 .native_session_id
@@ -558,9 +608,22 @@ pub fn serve(args: &[String]) -> i32 {
             return 2;
         }
     };
+    let env: Option<std::collections::BTreeMap<String, String>> =
+        serde_json::from_value(config["launch"]["env"].clone()).unwrap_or_default();
+    let mediation = match tool_mediation::required_by_host(host.env.as_ref(), env.as_ref()) {
+        Ok(mediation) => mediation,
+        Err(error) => {
+            eprintln!("resident configuration refused: {error}");
+            return 2;
+        }
+    };
     let stdin = std::io::BufReader::new(std::io::stdin());
     match endpoint::serve(
-        Arc::new(ClaudeTurns { config, base_argv }),
+        Arc::new(ClaudeTurns {
+            config,
+            base_argv,
+            mediation,
+        }),
         &state_root,
         stdin,
         std::io::stdout(),

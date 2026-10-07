@@ -13,6 +13,7 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod launch;
+mod mediation;
 pub mod resident;
 pub use launch::{run_native_effect_gate, NATIVE_EFFECT_GATE_ARG};
 
@@ -386,6 +387,20 @@ fn write_invocation_result<W: Write>(
     let subcommand = subcommand_from_args(args, request.request_id.clone())?;
     if subcommand == "launch" {
         let params = decode_launch_params(&request)?;
+        // Mediation is served by resident turns only; a one-shot launch
+        // never runs a policy it would not apply.
+        let mediated = agent_provider_contract::tool_mediation::required_by_host(
+            request.host.env.as_ref(),
+            Some(&params.env),
+        );
+        if !matches!(mediated, Ok(None)) {
+            return Err(ProviderFailure::unsupported(
+                request.request_id.clone(),
+                "tool_mediation_resident_only",
+                "oulipoly.tool_mediation/v1 is applied by resident Claude sessions only; this one-shot launch was not started",
+                3,
+            ));
+        }
         return launch::run(&request, params, writer);
     }
 
@@ -557,6 +572,34 @@ fn policy_evaluate_response(request: RequestEnvelope) -> Result<Value, ProviderF
         .unwrap_or_else(|| policy_base_argv(&policy, &params));
     validate_policy(&policy, &argv, &mut diagnostics);
     append_claude_provider_policy(&policy, &mut argv);
+    let mut markers = Vec::new();
+    match agent_provider_contract::tool_mediation::required_by_host(
+        request.host.env.as_ref(),
+        Some(&policy.env),
+    ) {
+        Err(error) => diagnostics.push(diagnostic(
+            "error",
+            &error.to_string(),
+            "tool_mediation_invalid",
+        )),
+        Ok(Some(mediation)) => {
+            if policy.tool_restrictions.is_some() {
+                diagnostics.push(diagnostic(
+                    "error",
+                    "tool_restrictions cannot be combined with the host's tool mediation",
+                    "tool_mediation_conflict",
+                ));
+            } else if let Some(conflict) = mediation::conflict(&argv, resident::VALUE_FLAGS) {
+                diagnostics.push(diagnostic("error", &conflict, "tool_mediation_conflict"));
+            } else {
+                markers.push(
+                    json!({"name": agent_provider_contract::tool_mediation::MARKER,
+                    "value": mediation::effective(&mediation)}),
+                );
+            }
+        }
+        Ok(None) => {}
+    }
 
     let accepted = !diagnostics.iter().any(|diagnostic| {
         diagnostic
@@ -582,7 +625,7 @@ fn policy_evaluate_response(request: RequestEnvelope) -> Result<Value, ProviderF
             "stdin": stdin,
             "prompt": prompt,
             "diagnostics": diagnostics,
-            "markers": [],
+            "markers": markers,
         }),
     ))
 }
@@ -3139,6 +3182,11 @@ pub fn describe_for(host_env: Option<&BTreeMap<String, String>>) -> Value {
     agent_provider_contract::resident_session::advertise(
         capabilities,
         agent_provider_contract::resident_session::SUPPORTED_VERSIONS,
+        host_env,
+    );
+    agent_provider_contract::tool_mediation::advertise(
+        capabilities,
+        agent_provider_contract::tool_mediation::SUPPORTED_VERSIONS,
         host_env,
     );
     result
