@@ -365,36 +365,170 @@ fn session_locate_transcript_falls_back_to_content_session_id() {
     let _ = std::fs::remove_dir_all(projects_dir);
 }
 
-#[test]
-fn session_read_turns_returns_stable_turns_and_zero_turn_completion() {
-    let projects_dir = temp_session_root("session-read-turns");
-    write_claude_transcript(&projects_dir, "sess-turns");
-    let output = invoke(
-        "session.read_turns",
-        session_params(&projects_dir, "sess-turns"),
-    );
-    assert!(output.status.success());
-    let response = json_stdout(&output);
-    let schema = compile_contract_ref("session.schema.json", "SessionReadTurnsResponse");
-    assert_valid(&schema, &response);
-    assert_eq!(response["result"]["complete"], true);
-    assert_eq!(response["result"]["turn_count"], 2);
-    assert_eq!(response["result"]["turns"][0]["turn_id"], "turn-user-1");
-    assert_eq!(response["result"]["turns"][0]["body"][0]["text"], "hello");
+const SESSION_TURN_PAGES_SELECTOR: &str = "OULIPOLY_HOST_SESSION_TURN_PAGES_V1";
 
-    let empty_path = projects_dir
-        .join("-tmp-workspace")
-        .join("empty-session.jsonl");
-    std::fs::write(&empty_path, "").unwrap();
-    let output = invoke(
-        "session.read_turns",
-        session_params(&projects_dir, "empty-session"),
+/// A bounded-page request exactly as the shared `SessionReadTurnsParams`
+/// defines it, which is what a conforming client sends.
+fn bounded_page_params(session_id: &str) -> Value {
+    json!({
+        "settings_id": "claude-primary",
+        "session_id": session_id,
+        "read_protocol": "oulipoly.session_turn_pages/v1",
+        "turn_projection": "canonical_ingest",
+        "start_mode": "beginning",
+        "after_token": null,
+        "snapshot_id": null,
+        "page_token": null,
+        "max_turns": 10,
+        "max_response_bytes": 65536,
+        "max_source_bytes": 1048576,
+        "max_inline_body_bytes": 4096
+    })
+}
+
+/// A config root whose `claude-primary` session store is located by a script
+/// that leaves a marker when it runs, so a test can tell whether an operation
+/// reached the native store at all.
+struct ScriptStore {
+    root: PathBuf,
+    marker: PathBuf,
+}
+
+fn script_store(label: &str, session_id: &str) -> ScriptStore {
+    let root = temp_session_root(label);
+    let transcript = write_claude_transcript(&root, session_id);
+    let marker = root.join("locator-ran");
+    std::fs::write(
+        root.join("providers.toml"),
+        format!(
+            "[claude-primary.session_storage]\nkind = 'script'\nlocate_script = 'touch \"{}\"; printf %s \"{}\"'\n",
+            marker.display(),
+            transcript.display()
+        ),
+    )
+    .unwrap();
+    ScriptStore { root, marker }
+}
+
+impl ScriptStore {
+    fn host(&self) -> Value {
+        json!({ "config_root": self.root.display().to_string() })
+    }
+
+    /// Every file under the store with its bytes.
+    fn snapshot(&self) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        fn walk(dir: &Path, out: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else {
+                    out.insert(path.clone(), std::fs::read(&path).unwrap());
+                }
+            }
+        }
+        let mut out = std::collections::BTreeMap::new();
+        walk(&self.root, &mut out);
+        out
+    }
+}
+
+fn assert_read_turns_refused(output: &Output) {
+    assert_eq!(output.status.code(), Some(3));
+    let response = json_stdout(output);
+    let schema = compile_contract_ref("session.schema.json", "SessionReadTurnsErrorResponse");
+    assert_valid(&schema, &response);
+    assert_eq!(response["ok"], false);
+    assert!(response.get("result").is_none());
+    assert_eq!(response["request_id"], "req-session.read_turns");
+    assert_eq!(response["error"]["category"], "unsupported");
+    assert_eq!(response["error"]["code"], "session_turn_pages_unsupported");
+    assert_eq!(response["error"]["retryable"], false);
+}
+
+#[test]
+fn describe_advertises_session_without_turn_pages_even_when_the_host_selects_them() {
+    for env in [json!({}), json!({ SESSION_TURN_PAGES_SELECTOR: "1" })] {
+        let output = invoke_with_host("describe", json!({}), json!({ "env": env }));
+        let response = json_stdout(&output);
+        let schema = compile_contract_ref("describe.schema.json", "DescribeResponse");
+        assert_valid(&schema, &response);
+        let capabilities = &response["result"]["capabilities"];
+        assert_eq!(capabilities["session"], true);
+        assert_ne!(capabilities["session_turn_pages_v1"], true);
+    }
+}
+
+#[test]
+fn session_read_turns_refuses_bounded_pages_without_reaching_the_native_store() {
+    let store = script_store("session-read-turns-pages", "sess-turns");
+    let params = bounded_page_params("sess-turns");
+    assert_valid(
+        &compile_contract_ref("session.schema.json", "SessionReadTurnsParams"),
+        &params,
     );
+    let before = store.snapshot();
+
+    let mut host = store.host();
+    host["env"] = json!({ SESSION_TURN_PAGES_SELECTOR: "1" });
+    let output = invoke_with_host("session.read_turns", params, host);
+
+    assert_read_turns_refused(&output);
+    assert!(
+        !store.marker.exists(),
+        "a refused read must not run the session locator"
+    );
+    assert_eq!(
+        store.snapshot(),
+        before,
+        "a refused read must change nothing"
+    );
+    let _ = std::fs::remove_dir_all(&store.root);
+}
+
+#[test]
+fn session_read_turns_no_longer_answers_the_legacy_request_with_legacy_turns() {
+    let store = script_store("session-read-turns-legacy", "sess-legacy");
+    let before = store.snapshot();
+
+    let output = invoke_with_host(
+        "session.read_turns",
+        json!({
+            "settings_id": "claude-primary",
+            "session_id": "sess-legacy",
+            "context": { "after_turn_id": "turn-user-1" }
+        }),
+        store.host(),
+    );
+
+    assert_read_turns_refused(&output);
+    assert!(!store.marker.exists());
+    assert_eq!(store.snapshot(), before);
+    let _ = std::fs::remove_dir_all(&store.root);
+}
+
+#[test]
+fn session_locate_transcript_still_reaches_the_store_that_read_turns_never_does() {
+    // The same store and locator as the refused reads above: locating runs
+    // the script and answers, so the marker those reads left absent is a
+    // real witness rather than a store that cannot be reached.
+    let store = script_store("session-locate-same-store", "sess-locate");
+
+    let output = invoke_with_host(
+        "session.locate_transcript",
+        json!({ "settings_id": "claude-primary", "session_id": "sess-locate" }),
+        store.host(),
+    );
+
     assert!(output.status.success());
     let response = json_stdout(&output);
-    assert_eq!(response["result"]["turn_count"], 0);
-    assert_eq!(response["result"]["complete"], true);
-    let _ = std::fs::remove_dir_all(projects_dir);
+    assert_valid(
+        &compile_contract_ref("session.schema.json", "SessionLocateTranscriptResponse"),
+        &response,
+    );
+    assert_eq!(response["result"]["located"], true);
+    assert!(store.marker.exists());
+    let _ = std::fs::remove_dir_all(&store.root);
 }
 
 #[test]

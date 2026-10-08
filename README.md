@@ -40,12 +40,13 @@ from the resolved `agent-provider-contract` crate; this repository carries no
 private wire-schema snapshot. The lock resolves SDK 0.3.0 at `99ad1183` as build
 provenance, without a manifest revision qualifier or runtime identity check.
 
-The adapter still has an older `session.read_turns` implementation returning
-`turns`, `turn_count` and `complete`. It does not implement the SDK's bounded
-`oulipoly.session_turn_pages/v1` shape and does not advertise
-`session_turn_pages_v1`. The shared-schema conformance test exposes this mismatch;
-SDK uptake is incomplete until that capability receives a separate implementation
-or disposition. Do not treat the older response as shared-contract conformance.
+`session.read_turns` is refused as `unsupported` (`session_turn_pages_unsupported`,
+exit 3) before any transcript lookup. The shared contract defines the method
+only as bounded `oulipoly.session_turn_pages/v1` pages; this adapter
+implements no pages and does not advertise `session_turn_pages_v1`, even when
+a host selects it. Generic `session` still covers `session.locate_transcript`,
+`session.capture`, `session.export` and `session.replace`. Bounded paging
+remains future shared work.
 
 **Launch output (`oulipoly.launch_output/v1`).** A launch whose params carry
 `output_delivery: {"protocol": "oulipoly.launch_output/v1"}` is admitted only
@@ -237,7 +238,8 @@ the original key only, not current prompt bytes. Describe admits future
 advertisements through the SDK's typed admission and common-version chooser,
 with declared preference and strict selected v1 payloads. Host replacement
 refresh, installed/native qualification and actual Runner joining remain open.
-The SDK's v1 snapshot realignment replaces the former session page shape;
+The SDK's v1 snapshot realignment replaces the former session page shape
+(this adapter no longer answers it; see `session.read_turns` above);
 it is not a compatible evolution or a wire major version. Other hosts are
 unqualified. Per-request terminal-unavailable selection remains required.
 
