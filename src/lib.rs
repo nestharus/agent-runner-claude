@@ -17,7 +17,7 @@ mod mediation;
 pub mod resident;
 pub use launch::{run_native_effect_gate, NATIVE_EFFECT_GATE_ARG};
 
-pub const CONTRACT: &str = "oulipoly.provider/v1";
+pub const CONTRACT: &str = agent_provider_contract::CONTRACT_VERSION;
 pub const SETTINGS_SCHEMA_ID: &str = "claude.settings/v1";
 const SETTINGS_SCHEMA_URI: &str = "https://oulipoly.dev/schemas/claude.settings/v1";
 
@@ -443,8 +443,9 @@ fn handle_decoded_invocation(
             &request.request_id,
             describe_for(request.host.env.as_ref()),
         )),
-        resident::PREPARE => resident::prepare(&request)
-            .map(|result| success_response(&request.request_id, result)),
+        resident::PREPARE => {
+            resident::prepare(&request).map(|result| success_response(&request.request_id, result))
+        }
         "schema" => schema_response(request),
         "policy.evaluate" => policy_evaluate_response(request),
         "terminal.classify" => terminal_classify_response(request),
@@ -459,7 +460,7 @@ fn handle_decoded_invocation(
         known if KNOWN_LATER_SUBCOMMANDS.contains(&known) => Err(ProviderFailure::unsupported(
             request.request_id,
             "capability_not_implemented",
-            format!("{known} is advertised for the Claude provider but is not implemented in this foundation slice"),
+            format!("{known} is not implemented by the Claude provider"),
             3,
         )),
         unknown => Err(ProviderFailure::unsupported(

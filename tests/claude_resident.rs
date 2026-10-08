@@ -15,7 +15,7 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-const CONTRACT: &str = "oulipoly.provider/v1";
+const CONTRACT: &str = agent_provider_contract::CONTRACT_VERSION;
 const TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Fake `claude -p --input-format stream-json --output-format stream-json`.
