@@ -857,36 +857,17 @@ fn session_locate_transcript_response(request: RequestEnvelope) -> Result<Value,
     ))
 }
 
+/// The shared contract defines `session.read_turns` only as bounded
+/// `oulipoly.session_turn_pages/v1` pages, selected by the host and advertised
+/// as `session_turn_pages_v1`. This adapter implements no pages and never
+/// advertises that capability, so the method is refused before any transcript
+/// lookup or read rather than answered with an unrelated body.
 fn session_read_turns_response(request: RequestEnvelope) -> Result<Value, ProviderFailure> {
-    let request_id = request.request_id.clone();
-    let config_root = request.host.config_root.clone();
-    let provider_instance_id = request.provider_instance_id.clone();
-    let params = decode_session_params(request, "invalid_session_read_turns_params")?;
-    validate_settings_id(&request_id, &params.settings_id)?;
-    let session_id = require_session_id(&request_id, &params)?;
-    let settings = session_settings_for_request(
-        &params,
-        provider_instance_id.as_deref(),
-        config_root.as_deref(),
-    );
-    let located = locate_transcript(&request_id, &settings, &session_id)?;
-    let mut turns = read_claude_turns(&request_id, &located, &session_id)?;
-    if let Some(after) = session_context_string(&params, "after_turn_id") {
-        if let Some(index) = turns
-            .iter()
-            .position(|turn| turn.get("turn_id").and_then(Value::as_str) == Some(after.as_str()))
-        {
-            turns = turns.split_off(index + 1);
-        }
-    }
-
-    Ok(success_response(
-        &request_id,
-        json!({
-            "turn_count": turns.len(),
-            "turns": turns,
-            "complete": transcript_is_complete(&located),
-        }),
+    Err(ProviderFailure::unsupported(
+        request.request_id,
+        "session_turn_pages_unsupported",
+        "session.read_turns requires oulipoly.session_turn_pages/v1, which the Claude provider does not implement or advertise as session_turn_pages_v1",
+        3,
     ))
 }
 
@@ -1770,58 +1751,6 @@ fn file_contains_session_id(path: &Path, session_id: &str) -> bool {
         })
 }
 
-fn read_claude_turns(
-    request_id: &str,
-    path: &Path,
-    session_id: &str,
-) -> Result<Vec<Value>, ProviderFailure> {
-    let lines = scan_jsonl_file(request_id, path)?;
-    let mut turns = Vec::new();
-    for line in lines {
-        if line.value.get("sessionId").and_then(Value::as_str) != Some(session_id) {
-            continue;
-        }
-        let kind = line.value.get("type").and_then(Value::as_str);
-        let compact = line
-            .value
-            .get("isCompactSummary")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if !matches!(kind, Some("user" | "assistant")) && !compact {
-            continue;
-        }
-        let Some(turn_id) = line.value.get("uuid").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(timestamp) = line.value.get("timestamp").and_then(Value::as_str) else {
-            continue;
-        };
-        let mut turn = json!({
-            "session_id": session_id,
-            "turn_id": turn_id,
-            "timestamp": timestamp,
-            "role": kind,
-            "parent_turn_id": line.value.get("parentUuid").cloned().unwrap_or(Value::Null),
-            "is_sidechain": line.value.get("isSidechain").cloned().unwrap_or(Value::Null),
-            "is_compaction_boundary": compact,
-            "status": if transcript_is_complete(path) { "complete" } else { "partial" },
-        });
-        let body = extract_claude_body_json(&line.value);
-        if !body.is_empty() {
-            turn["body"] = Value::Array(body);
-        }
-        turns.push(turn);
-    }
-    Ok(turns)
-}
-
-fn transcript_is_complete(path: &Path) -> bool {
-    let Ok(bytes) = fs::read(path) else {
-        return false;
-    };
-    bytes.is_empty() || bytes.last() == Some(&b'\n')
-}
-
 fn capture_result(
     request_id: &str,
     params: &SessionParams,
@@ -2151,13 +2080,6 @@ fn extract_claude_content(value: &Value) -> Vec<ContentChunk> {
         }
     }
     extract_content_chunks(value.get("content"))
-}
-
-fn extract_claude_body_json(value: &Value) -> Vec<Value> {
-    extract_claude_content(value)
-        .into_iter()
-        .map(|chunk| json!({ "type": chunk.chunk_type, "text": chunk.text.unwrap_or_default() }))
-        .collect()
 }
 
 fn extract_content_chunks(value: Option<&Value>) -> Vec<ContentChunk> {
