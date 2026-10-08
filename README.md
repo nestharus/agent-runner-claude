@@ -35,11 +35,17 @@ printf '%s' '{"contract":"oulipoly.provider/v1","request_id":"req-1","host":{"ap
 `host.env` selected it: `launch_output_v1` for
 `OULIPOLY_HOST_LAUNCH_OUTPUT_V1=1` and `resident_session_v1` for
 `OULIPOLY_HOST_RESIDENT_SESSION_V1=1`. An offer of another resident version
-alone advertises nothing. The carried `contract/v1` describe, common, launch and
-policy schemas are byte-identical to the `agent-provider-sdk` snapshot at commit
-`38acb566f985a77cd6a623257bfe7feb0302da62` (Agent Runner `5d025b82` plus the
-resident capability and advertisement-only widening); `session.schema.json` keeps this provider's earlier
-`session.read_turns` shape, and `session_turn_pages_v1` is not advertised.
+alone advertises nothing. Contract definitions and conformance validation come
+from the resolved `agent-provider-contract` crate; this repository carries no
+private wire-schema snapshot. The lock resolves SDK 0.3.0 at `99ad1183` as build
+provenance, without a manifest revision qualifier or runtime identity check.
+
+The adapter still has an older `session.read_turns` implementation returning
+`turns`, `turn_count` and `complete`. It does not implement the SDK's bounded
+`oulipoly.session_turn_pages/v1` shape and does not advertise
+`session_turn_pages_v1`. The shared-schema conformance test exposes this mismatch;
+SDK uptake is incomplete until that capability receives a separate implementation
+or disposition. Do not treat the older response as shared-contract conformance.
 
 **Launch output (`oulipoly.launch_output/v1`).** A launch whose params carry
 `output_delivery: {"protocol": "oulipoly.launch_output/v1"}` is admitted only
@@ -231,7 +237,7 @@ the original key only, not current prompt bytes. Describe admits future
 advertisements through the SDK's typed admission and common-version chooser,
 with declared preference and strict selected v1 payloads. Host replacement
 refresh, installed/native qualification and actual Runner joining remain open.
-The SDK's 0.2.0 v1 snapshot realignment replaces the former session page shape;
+The SDK's v1 snapshot realignment replaces the former session page shape;
 it is not a compatible evolution or a wire major version. Other hosts are
 unqualified. Per-request terminal-unavailable selection remains required.
 

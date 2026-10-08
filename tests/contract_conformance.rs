@@ -5,7 +5,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-const CONTRACT: &str = "oulipoly.provider/v1";
+const CONTRACT: &str = agent_provider_contract::CONTRACT_VERSION;
 
 fn invoke(subcommand: &str, params: Value) -> Output {
     invoke_with_host(subcommand, params, json!({}))
@@ -69,19 +69,13 @@ fn json_stdout(output: &Output) -> Value {
 }
 
 fn compile_contract_ref(schema_file: &str, def_name: &str) -> JSONSchema {
-    let common: Value =
-        serde_json::from_str(include_str!("../contract/v1/common.schema.json")).unwrap();
-    let schema_text = match schema_file {
-        "describe.schema.json" => include_str!("../contract/v1/describe.schema.json"),
-        "schema.schema.json" => include_str!("../contract/v1/schema.schema.json"),
-        "policy.schema.json" => include_str!("../contract/v1/policy.schema.json"),
-        "terminal.schema.json" => include_str!("../contract/v1/terminal.schema.json"),
-        "quota.schema.json" => include_str!("../contract/v1/quota.schema.json"),
-        "launch.schema.json" => include_str!("../contract/v1/launch.schema.json"),
-        "session.schema.json" => include_str!("../contract/v1/session.schema.json"),
-        "common.schema.json" => include_str!("../contract/v1/common.schema.json"),
-        other => panic!("unhandled schema file: {other}"),
-    };
+    // Validate against the resolved SDK, never a provider-private snapshot.
+    let common: Value = serde_json::from_str(
+        agent_provider_contract::schemas::schema_by_file("common.schema.json").unwrap(),
+    )
+    .unwrap();
+    let schema_text = agent_provider_contract::schemas::schema_by_file(schema_file)
+        .unwrap_or_else(|| panic!("unhandled SDK schema file: {schema_file}"));
     let schema_doc: Value = serde_json::from_str(schema_text).unwrap();
     let mut root = bundled_contract_schema(common, schema_doc, def_name);
 

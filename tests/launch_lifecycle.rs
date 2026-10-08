@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const CONTRACT: &str = "oulipoly.provider/v1";
+const CONTRACT: &str = agent_provider_contract::CONTRACT_VERSION;
 
 struct Fixture {
     root: tempfile::TempDir,
