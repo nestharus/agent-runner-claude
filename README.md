@@ -37,7 +37,7 @@ printf '%s' '{"contract":"oulipoly.provider/v1","request_id":"req-1","host":{"ap
 `OULIPOLY_HOST_RESIDENT_SESSION_V1=1`. An offer of another resident version
 alone advertises nothing. Contract definitions and conformance validation come
 from the resolved `agent-provider-contract` crate; this repository carries no
-private wire-schema snapshot. The lock resolves SDK 0.3.0 at `99ad1183` as build
+private wire-schema snapshot. The lock resolves SDK 0.3.0 at `8abdd73c` as build
 provenance, without a manifest revision qualifier or runtime identity check.
 
 `session.read_turns` is refused as `unsupported` (`session_turn_pages_unsupported`,
@@ -45,8 +45,8 @@ exit 3) before any transcript lookup. The shared contract defines the method
 only as bounded `oulipoly.session_turn_pages/v1` pages; this adapter
 implements no pages and does not advertise `session_turn_pages_v1`, even when
 a host selects it. Generic `session` still covers `session.locate_transcript`,
-`session.capture`, `session.export` and `session.replace`. Bounded paging
-remains future shared work.
+`session.capture`, `session.export` and `session.replace`. This adapter does not
+consume the SDK paging engine.
 
 **Launch output (`oulipoly.launch_output/v1`).** A launch whose params carry
 `output_delivery: {"protocol": "oulipoly.launch_output/v1"}` is admitted only
@@ -77,17 +77,44 @@ content-addressed under
 native Claude Code CLI once through the SDK lifecycle, as
 `<template> -p --input-format stream-json --output-format stream-json --verbose
 --replay-user-messages`, with `--session-id <uuid>` (an id this provider
-chooses) on the session's first turn and `--resume <uuid>` afterwards, in the
-session's working directory, writing one stream-JSON user message on stdin. The
-`system/init` event names the native session; the replayed user message (its
-`uuid`, message content/role, session and no tool parent) is the consumption that acknowledges the prompt; each
-main-thread assistant message with text is one ACP `agent_message` (subagent and
+chooses as a create candidate) until native identity is observed, and
+`--resume <uuid>` after that observation, in the session's working directory, writing one stream-JSON user message on stdin. The
+`system/init` event names the native session; a create candidate is not an
+observed identity and is not reported as one in terminal receipts. The replayed
+user message (its
+`uuid`, message content/role, observed session and no tool parent) is the
+consumption that acknowledges the prompt; each main-thread assistant message with text is one ACP `agent_message` (subagent and
 tool-use records are not); the turn succeeds only with a `result` of subtype
 `success` and no error, otherwise an exit 0 is reported as exit 1. Stderr is
 accounted and kept for terminal classification. `session/cancel` terminates only
 that turn's process group. The native stream-JSON behaviour is exercised here
 against a deterministic fake CLI only (`tests/claude_resident.rs`); it has not
 been qualified against a live Claude Code CLI. Never the Claude Agent SDK.
+
+A first native turn that actually ran but ended before observed session identity
+remains recognizable by its native status, terminal signal and complete output
+accounting. The SDK blocks later prompts and resume as session-unavailable
+(`-32012`), durably across endpoint reopen; it does not rerun the original input.
+A candidate echo before `system/init` cannot acknowledge a first turn. An
+identity observed on a prior turn stays known when a later turn fails before init.
+
+An actual SDK-observed gate Spawn or Exec failure is instead settled by this
+adapter as `spawn_error`, with its OS diagnostic and an empty output-completion
+marker. The SDK owns the complete receipt and positive never-run fact. Failed
+Exec already carried that fact in the shared lifecycle; this adapter changes its
+label and terminal mapping. Settling Spawn also changes its custody from an
+incomplete launch to a complete receipt. A later explicitly requested turn can
+create after such a proven failed start; no failure triggers an automatic retry.
+Exit 126, diagnostic text, missing consumption and a successfully executed
+wrapper whose inner command fails are not never-run proof.
+
+The resolved SDK also carries the shared explore renderer and tool custody
+already present at the previous lock, resident uncertainty and complete-replay
+recovery, the lifecycle's SDK-private never-run receipt fact, and compiled but
+unused common session-page code. H continues to refuse `session.read_turns` and
+advertise its existing selected capabilities. Fake source controls exercise this
+provider binary and SDK endpoint/lifecycle; they establish no installed bridge,
+real CLI semantics, Runner pairing, restart qualification or stress completion.
 
 ## Host tool mediation (`oulipoly.tool_mediation/v1`)
 
