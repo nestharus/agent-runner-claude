@@ -30,7 +30,7 @@ use agent_provider_execution::custody::RequestCustody;
 use agent_provider_execution::encoding::canonical_json_bytes;
 use agent_provider_execution::lifecycle::{
     self, Channel, EventSink, LaunchAdapter, LaunchSpec, LifecycleTiming, NativeCommand,
-    NativeOutcome, OutputFraming, Preparation, Terminal,
+    NativeOutcome, OutputFraming, Preparation, StartFailure, Terminal,
 };
 use agent_provider_execution::resident::{
     self as endpoint, ResidentTurns, TurnFailure, TurnFailureKind, TurnRequest,
@@ -355,6 +355,7 @@ impl ResidentTurns for ClaudeTurns {
                 .native_session_id
                 .clone()
                 .or_else(|| turn.create_native_session_id.clone()),
+            observed_native_session: turn.native_session_id.clone(),
             consumed: false,
             result: None,
             stdout: Vec::new(),
@@ -374,7 +375,10 @@ struct ResidentTurn<'a> {
     exploration: Option<&'a Exploration>,
     /// Identity of the submitted user message, echoed by the replay.
     user_uuid: String,
+    /// Selected identity used in argv/stdin, including an unobserved create candidate.
     native_session: Option<String>,
+    /// A prior observed session, or this turn's validated system/init identity.
+    observed_native_session: Option<String>,
     consumed: bool,
     result: Option<Value>,
     stdout: Vec<u8>,
@@ -419,13 +423,14 @@ impl ResidentTurn<'_> {
     }
 
     fn echoes_input(&self, event: &Value) -> bool {
-        event["type"] == json!("user")
+        self.observed_native_session.is_some()
+            && event["type"] == json!("user")
             && event["uuid"].as_str() == Some(self.user_uuid.as_str())
             && event["parent_tool_use_id"].is_null()
             && event["isSidechain"] != json!(true)
             && event["message"]["role"] == json!("user")
             && event["message"]["content"] == json!([{"type":"text","text":self.turn.prompt}])
-            && event["session_id"].as_str() == self.native_session.as_deref()
+            && event["session_id"].as_str() == self.observed_native_session.as_deref()
     }
 }
 
@@ -481,6 +486,30 @@ impl LaunchAdapter for ResidentTurn<'_> {
         }))
     }
 
+    /// Only the SDK's observed gate Spawn/Exec failure reaches this hook.
+    /// Label the native outcome; the SDK owns completion and never-run proof.
+    fn start_failed<W: Write>(
+        &mut self,
+        failure: &StartFailure,
+        events: &mut EventSink<'_, W>,
+    ) -> Result<Option<Terminal>, ProviderFailure> {
+        let (StartFailure::Spawn(error) | StartFailure::Exec(error)) = failure;
+        let status = ProcessStatus::SpawnError {
+            reason: format!("Failed to spawn Claude provider command: {error}"),
+        };
+        let signal = classify_terminal_signal(&[], &[], &status, now_unix_ms());
+        events.event(output_complete_marker(events.accounting().to_json()))?;
+        Ok(Some(Terminal {
+            status: serde_json::to_value(&status).expect("process status serializes"),
+            terminal_signal: terminal_signal_json(&signal),
+            session: self
+                .observed_native_session
+                .as_ref()
+                .map(|id| json!({"provider_session_id":id})),
+            exit_code: 0,
+        }))
+    }
+
     fn output<W: Write>(
         &mut self,
         channel: Channel,
@@ -530,6 +559,7 @@ impl LaunchAdapter for ResidentTurn<'_> {
                 }
                 {
                     self.native_session = Some(id.to_owned());
+                    self.observed_native_session = Some(id.to_owned());
                     events.marker(
                         endpoint::PROVIDER_SESSION_MARKER,
                         json!({"provider_session_id":id,"source":"claude.stream_json"}),
@@ -540,7 +570,7 @@ impl LaunchAdapter for ResidentTurn<'_> {
                 self.consumed = true;
                 events.marker(
                     endpoint::SUBMITTED_USER_TURN_MARKER,
-                    json!({"provider_session_id":self.native_session,
+                    json!({"provider_session_id":self.observed_native_session,
                         "prompt_sha256":sha256_hex(self.turn.prompt.as_bytes()),
                         "source":"claude.stream_json.replay"}),
                 )?;
@@ -586,7 +616,10 @@ impl LaunchAdapter for ResidentTurn<'_> {
         Ok(Terminal {
             status: serde_json::to_value(&status).expect("process status serializes"),
             terminal_signal: terminal_signal_json(&signal),
-            session: Some(json!({"provider_session_id":self.native_session})),
+            session: self
+                .observed_native_session
+                .as_ref()
+                .map(|id| json!({"provider_session_id":id})),
             exit_code: 0,
         })
     }

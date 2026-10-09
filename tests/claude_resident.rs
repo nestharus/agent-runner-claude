@@ -41,6 +41,14 @@ session = options.get('--resume', options.get('--session-id', 'chosen-by-claude'
 def emit(event):
     print(json.dumps(event), flush=True)
 words = prompt.split()
+# These programs really started and received input; neither 126 nor an exact
+# echo of a provider-chosen candidate proves an observed native session.
+if words[0] == 'preinitfail':
+    print('fixture failed before system/init (not an exec proof)', file=sys.stderr, flush=True)
+    sys.exit(126)
+if words[0] == 'preinitecho':
+    emit({'type': 'user', 'uuid': message['uuid'], 'session_id': session, 'message': message['message']})
+    sys.exit(1)
 if words[0] == 'invalidsession':
     session = 'not-a-uuid'
 if words[0] == 'driftsession':
@@ -729,4 +737,224 @@ fn native_session_shape_and_drift_are_refused_without_consumption() {
             Some(known)
         );
     }
+}
+
+fn session_directory(prepared: &Value, session: &str) -> PathBuf {
+    PathBuf::from(prepared["invocation"]["args"][2].as_str().unwrap())
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("sessions")
+        .join(session)
+}
+
+fn session_record(prepared: &Value, session: &str) -> Value {
+    serde_json::from_slice(
+        &std::fs::read(session_directory(prepared, session).join("session.json")).unwrap(),
+    )
+    .unwrap()
+}
+
+fn turn_events(prepared: &Value, session: &str, native: &Value) -> Vec<Value> {
+    let key = agent_provider_execution::custody::request_key(
+        None,
+        native["request_id"].as_str().unwrap(),
+    );
+    let journal = session_directory(prepared, session)
+        .join("turns")
+        .join(format!("{key}.jsonl"));
+    events(&std::fs::read_to_string(journal).unwrap())
+}
+
+fn assert_no_reported_identity(events: &[Value]) {
+    assert_complete_output(events);
+    assert!(
+        !events.iter().any(|event| event["name"]
+            == json!(agent_provider_execution::resident::PROVIDER_SESSION_MARKER)
+            || event["name"]
+                == json!(agent_provider_execution::resident::SUBMITTED_USER_TURN_MARKER)),
+        "{events:?}"
+    );
+    assert!(
+        events.last().unwrap().get("session").is_none(),
+        "candidate must not appear in the exit as known identity: {events:?}"
+    );
+}
+
+/// Intent: U277 G3 / ROOT D3, U282 D5 and the U283 goal. An executed
+/// pre-init failure is not a never-started fact; the candidate must remain
+/// unobserved and later work must stay blocked across endpoint reopen.
+#[test]
+fn pre_identity_failures_block_later_work_and_reopen_without_rerun() {
+    for prompt in ["preinitfail", "preinitecho"] {
+        let f = Fixture::new();
+        let prepared = f.prepare();
+        let mut client = Client::serve(&prepared);
+        let session = client.open(&f.path().join("work"));
+        let request = client.prompt(&session, prompt, Some("original"));
+        let response = client.response(request);
+        assert_eq!(
+            response["error"]["code"],
+            json!(-32010),
+            "{prompt}: {response}"
+        );
+        let native = &response["error"]["data"]["nativeTurn"];
+        assert_eq!(native["custody"], json!("complete"), "{response}");
+        assert_eq!(
+            native["status"],
+            json!({"kind":"exited","code":if prompt == "preinitfail" {126} else {1}})
+        );
+        let journal = turn_events(&prepared, &session, native);
+        assert_no_reported_identity(&journal);
+        eprintln!("control={prompt} journal={}", json!(journal));
+        let record = session_record(&prepared, &session);
+        assert!(
+            record["native_session_id"].is_null(),
+            "candidate is not observed: {record}"
+        );
+        assert!(record["create_native_session_id"].is_string(), "{record}");
+        assert!(record["native_session_uncertain"].is_string(), "{record}");
+        let next = client.prompt(&session, "hello", None);
+        assert_eq!(client.response(next)["error"]["code"], json!(-32012));
+        drop(client);
+
+        let mut client = Client::serve(&prepared);
+        client.call(
+            "initialize",
+            json!({"protocolVersion":2,"info":{"name":"t","version":"0"}}),
+        );
+        let loaded = client.call(
+            "session/resume",
+            json!({"sessionId":session,"cwd":f.path().join("work")}),
+        );
+        assert_eq!(loaded["error"]["code"], json!(-32012), "{loaded}");
+        assert!(loaded["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("identity"));
+        let duplicate = client.prompt(&session, prompt, Some("original"));
+        assert!(
+            client.response(duplicate).get("error").is_some(),
+            "original input must not be ACKed/rerun"
+        );
+        let next = client.prompt(&session, "hello", None);
+        assert_eq!(client.response(next)["error"]["code"], json!(-32012));
+        assert_eq!(f.calls().len(), 1, "no later native effect or rerun");
+        eprintln!(
+            "control={prompt} response={response} record={record} reopen={loaded} calls={}",
+            json!(f.calls())
+        );
+    }
+}
+
+/// Intent: a real failed gate exec or spawn is recognizable as spawn_error;
+/// SDK complete never-run evidence permits a later explicitly requested turn,
+/// without inventing native identity or starting the refused input again.
+#[test]
+fn observed_start_failures_settle_without_identity_then_allow_explicit_create() {
+    for failure in ["exec", "spawn"] {
+        let f = Fixture::new();
+        let prepared = f.prepare();
+        let cwd = f.path().join("work");
+        let mut client = Client::serve(&prepared);
+        let session = client.open(&cwd);
+        if failure == "exec" {
+            std::fs::remove_file(f.path().join("claude")).unwrap();
+        } else {
+            std::fs::remove_dir(&cwd).unwrap();
+        }
+        let request = client.prompt(&session, "hello", Some("failed-start"));
+        let response = client.response(request);
+        assert_eq!(
+            response["error"]["code"],
+            json!(-32010),
+            "{failure}: {response}"
+        );
+        let native = &response["error"]["data"]["nativeTurn"];
+        assert_eq!(native["custody"], json!("complete"), "{response}");
+        assert_eq!(native["status"]["kind"], json!("spawn_error"), "{response}");
+        assert!(native["status"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("Failed to spawn Claude provider command"));
+        assert_eq!(native["launch_output"]["data_event_count"], json!(0));
+        let journal = turn_events(&prepared, &session, native);
+        assert_no_reported_identity(&journal);
+        eprintln!("control={failure} journal={}", json!(journal));
+        let record = session_record(&prepared, &session);
+        assert!(record["native_session_id"].is_null(), "{record}");
+        assert!(record["native_session_uncertain"].is_null(), "{record}");
+        assert_eq!(f.calls().len(), 0);
+        drop(client);
+        if failure == "exec" {
+            std::fs::write(f.path().join("claude"), FAKE_CLAUDE).unwrap();
+            std::fs::set_permissions(
+                f.path().join("claude"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        } else {
+            std::fs::create_dir(&cwd).unwrap();
+        }
+        let mut client = Client::serve(&prepared);
+        client.call(
+            "initialize",
+            json!({"protocolVersion":2,"info":{"name":"t","version":"0"}}),
+        );
+        let loaded = client.call("session/resume", json!({"sessionId":session,"cwd":cwd}));
+        assert!(loaded.get("result").is_some(), "{loaded}");
+        let duplicate = client.prompt(&session, "hello", Some("failed-start"));
+        assert_eq!(client.response(duplicate)["error"]["code"], json!(-32010));
+        assert_eq!(
+            f.calls().len(),
+            0,
+            "settled failure must not rerun after fake is restored"
+        );
+        let next = client.prompt(&session, "hello", None);
+        let next = message_id(&client.response(next));
+        assert_eq!(client.idle_for(&next)["stopReason"], json!("end_turn"));
+        let calls = f.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(flag_value(&argv(&calls[0]), "--resume"), None);
+        assert_eq!(
+            flag_value(&argv(&calls[0]), "--session-id"),
+            record["create_native_session_id"]
+                .as_str()
+                .map(String::from)
+        );
+        eprintln!(
+            "control={failure} response={response} record={record} reopen={loaded} calls={}",
+            json!(calls)
+        );
+    }
+}
+
+#[test]
+fn observed_identity_survives_no_consumption_and_result_remains_required() {
+    let f = Fixture::new();
+    let prepared = f.prepare();
+    let mut client = Client::serve(&prepared);
+    let session = client.open(&f.path().join("work"));
+    let request = client.prompt(&session, "noconsume", None);
+    assert_eq!(client.response(request)["error"]["code"], json!(-32010));
+    let record = session_record(&prepared, &session);
+    let native = record["native_session_id"].as_str().unwrap();
+    assert!(record["native_session_uncertain"].is_null(), "{record}");
+    let request = client.prompt(&session, "noresult", None);
+    let id = message_id(&client.response(request));
+    let idle = client.idle_for(&id);
+    assert_eq!(idle["stopReason"], json!("_oulipoly_native_failed"));
+    assert_eq!(
+        idle["_meta"]["oulipoly.ai/nativeTurn"]["status"],
+        json!({"kind":"exited","code":1})
+    );
+    assert_eq!(
+        flag_value(&argv(&f.calls()[1]), "--resume").as_deref(),
+        Some(native)
+    );
+    eprintln!(
+        "control=observed-noresult record={record} idle={idle} calls={}",
+        json!(f.calls())
+    );
 }
