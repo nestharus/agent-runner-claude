@@ -74,8 +74,8 @@ fn resident_root(host: &HostContext) -> Result<PathBuf, ProviderFailure> {
         Some(root) => PathBuf::from(root),
         None => host
             .env
-            .as_ref()
-            .and_then(|env| env.get("HOME").cloned())
+            .get("HOME")
+            .cloned()
             .or_else(|| std::env::var("HOME").ok())
             .filter(|home| !home.is_empty())
             .map(|home| Path::new(&home).join(".local/share/oulipoly-agent-runner"))
@@ -196,12 +196,15 @@ fn turn_argv(base: &[String], turn: &TurnRequest) -> Vec<String> {
 }
 
 /// `resident.prepare`.
-pub(crate) fn prepare(request: &RequestEnvelope) -> Result<Value, ProviderFailure> {
+pub(crate) fn prepare(
+    request: &RequestEnvelope,
+    mut host: Value,
+) -> Result<Value, ProviderFailure> {
     let id = &request.request_id;
     if !resident_session::FAMILY
         .advertised(
             resident_session::SUPPORTED_VERSIONS,
-            request.host.env.as_ref(),
+            Some(&request.host.env),
         )
         .contains(&1)
     {
@@ -217,7 +220,7 @@ pub(crate) fn prepare(request: &RequestEnvelope) -> Result<Value, ProviderFailur
     base_argv(&params.launch.argv)
         .map_err(|message| invalid(id, "invalid_resident_argv", message))?;
     let mediated =
-        tool_mediation::required_by_host(request.host.env.as_ref(), params.launch.env.as_ref())
+        tool_mediation::required_by_host(Some(&request.host.env), params.launch.env.as_ref())
             .map_err(|error| invalid(id, "tool_mediation_invalid", error.to_string()))?;
     if mediated.is_some() {
         if let Some(conflict) = crate::mediation::conflict(&params.launch.argv, VALUE_FLAGS) {
@@ -225,12 +228,26 @@ pub(crate) fn prepare(request: &RequestEnvelope) -> Result<Value, ProviderFailur
         }
     }
     crate::admit_exploration(
-        request.host.env.as_ref(),
+        Some(&request.host.env),
         params.launch.env.as_ref(),
         mediated.as_ref(),
     )
     .map_err(|(code, message)| invalid(id, code, message))?;
-    let mut host = serde_json::to_value(&request.host).expect("host serializes");
+    // Keep the durable configuration projection stable across SDK DTO adoption:
+    // the former serializer represented missing optional host fields as null.
+    for key in [
+        "app_version",
+        "platform",
+        "working_directory",
+        "config_root",
+        "data_root",
+        "env",
+    ] {
+        host.as_object_mut()
+            .expect("admitted host object")
+            .entry(key)
+            .or_insert(Value::Null);
+    }
     // A resident endpoint outlives this request: its deadline does not apply.
     host["deadline_unix_ms"] = Value::Null;
     let config = json!({"protocol": resident_session::PROTOCOL, "provider": "claude",
@@ -644,7 +661,15 @@ pub fn serve(args: &[String]) -> i32 {
             return 2;
         }
     };
-    let host: HostContext = match serde_json::from_value(config["host"].clone()) {
+    // Older, integrity-checked configurations persist an absent env as null.
+    // Normalize only that storage representation, not incoming wire admission.
+    let mut stored_host = config["host"].clone();
+    if stored_host["env"].is_null() {
+        if let Some(host) = stored_host.as_object_mut() {
+            host.remove("env");
+        }
+    }
+    let host: HostContext = match serde_json::from_value(stored_host) {
         Ok(host) => host,
         Err(error) => {
             eprintln!("resident configuration refused: {error}");
@@ -669,7 +694,7 @@ pub fn serve(args: &[String]) -> i32 {
     };
     let env: Option<std::collections::BTreeMap<String, String>> =
         serde_json::from_value(config["launch"]["env"].clone()).unwrap_or_default();
-    let mediation = match tool_mediation::required_by_host(host.env.as_ref(), env.as_ref()) {
+    let mediation = match tool_mediation::required_by_host(Some(&host.env), env.as_ref()) {
         Ok(mediation) => mediation,
         Err(error) => {
             eprintln!("resident configuration refused: {error}");
@@ -677,7 +702,7 @@ pub fn serve(args: &[String]) -> i32 {
         }
     };
     let exploration =
-        match crate::admit_exploration(host.env.as_ref(), env.as_ref(), mediation.as_ref()) {
+        match crate::admit_exploration(Some(&host.env), env.as_ref(), mediation.as_ref()) {
             Ok(exploration) => exploration,
             Err((_, message)) => {
                 eprintln!("resident configuration refused: {message}");

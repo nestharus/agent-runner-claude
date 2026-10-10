@@ -62,8 +62,7 @@ fn output_requested(
     let selected = request
         .host
         .env
-        .as_ref()
-        .and_then(|env| env.get(crate::HOST_LAUNCH_OUTPUT_ENV))
+        .get(crate::HOST_LAUNCH_OUTPUT_ENV)
         .map(String::as_str)
         == Some("1");
     if !selected {
@@ -112,6 +111,7 @@ pub(crate) fn output_complete_marker(accounting: Value) -> Value {
 
 pub(crate) fn run<W: Write>(
     request: &RequestEnvelope,
+    wire_host_env: &Value,
     params: LaunchParams,
     writer: &mut W,
 ) -> Result<i32, ProviderFailure> {
@@ -129,6 +129,7 @@ pub(crate) fn run<W: Write>(
     };
     let mut adapter = ClaudeLaunch {
         request,
+        wire_host_env,
         params,
         output_requested,
         stdout: Vec::new(),
@@ -147,8 +148,8 @@ pub(crate) fn state_root(request: &RequestEnvelope) -> Result<PathBuf, ProviderF
     request
         .host
         .env
-        .as_ref()
-        .and_then(|env| env.get("HOME").cloned())
+        .get("HOME")
+        .cloned()
         .or_else(|| std::env::var("HOME").ok())
         .filter(|home| !home.is_empty())
         .map(|home| Path::new(&home).join(".local/share/oulipoly-agent-runner"))
@@ -163,6 +164,7 @@ pub(crate) fn state_root(request: &RequestEnvelope) -> Result<PathBuf, ProviderF
 
 struct ClaudeLaunch<'a> {
     request: &'a RequestEnvelope,
+    wire_host_env: &'a Value,
     params: LaunchParams,
     output_requested: bool,
     stdout: Vec<u8>,
@@ -204,7 +206,7 @@ impl LaunchAdapter for ClaudeLaunch<'_> {
         let request = self.request;
         Ok(sha256_hex(
             &serde_json::to_vec(&json!({"params":request.params,
-                "host_env":request.host.env,
+                "host_env":self.wire_host_env,
                 "host_working_directory":request.host.working_directory}))
             .expect("launch digest input serializes"),
         ))

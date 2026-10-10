@@ -12,6 +12,7 @@ use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod admission;
 mod launch;
 mod mediation;
 pub mod resident;
@@ -47,36 +48,9 @@ pub struct InvocationOutput {
     pub exit_code: i32,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct RequestEnvelope {
-    contract: String,
-    request_id: String,
-    #[allow(dead_code)]
-    provider_instance_id: Option<String>,
-    host: HostContext,
-    params: Value,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct HostContext {
-    app: String,
-    #[allow(dead_code)]
-    app_version: Option<String>,
-    #[allow(dead_code)]
-    platform: Option<String>,
-    #[allow(dead_code)]
-    working_directory: Option<String>,
-    #[allow(dead_code)]
-    config_root: Option<String>,
-    #[allow(dead_code)]
-    data_root: Option<String>,
-    #[allow(dead_code)]
-    env: Option<BTreeMap<String, String>>,
-    #[allow(dead_code)]
-    deadline_unix_ms: Option<u64>,
-}
+// Base wire representations come from the resolved SDK. Adapter projections
+// below are consumed only after shared schema admission.
+pub(crate) use agent_provider_contract::generated::{HostContext, RequestEnvelope};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -172,12 +146,6 @@ struct SessionParams {
     provider_name: Option<String>,
     #[serde(default)]
     context: Option<Value>,
-    #[serde(default)]
-    canonical_format: Option<String>,
-    #[serde(default)]
-    data_base64: Option<String>,
-    #[serde(default)]
-    preimage_sha256: Option<String>,
     #[serde(default)]
     stdout_base64: Option<String>,
     #[serde(default)]
@@ -383,14 +351,15 @@ fn write_invocation_result<W: Write>(
     stdin: &str,
     writer: &mut W,
 ) -> Result<i32, ProviderFailure> {
-    let request = decode_request(stdin)?;
+    let (request, wire_host) = decode_request(stdin)?;
     let subcommand = subcommand_from_args(args, request.request_id.clone())?;
+    admission::operation(subcommand, &request)?;
     if subcommand == "launch" {
         let params = decode_launch_params(&request)?;
         // Mediation is served by resident turns only; a one-shot launch
         // never runs a policy it would not apply.
         let mediated = agent_provider_contract::tool_mediation::required_by_host(
-            request.host.env.as_ref(),
+            Some(&request.host.env),
             Some(&params.env),
         );
         if !matches!(mediated, Ok(None)) {
@@ -403,7 +372,7 @@ fn write_invocation_result<W: Write>(
         }
         // An exploration offer needs mediation, so it is refused here too.
         if let Err((code, message)) =
-            admit_exploration(request.host.env.as_ref(), Some(&params.env), None)
+            admit_exploration(Some(&request.host.env), Some(&params.env), None)
         {
             return Err(ProviderFailure::unsupported(
                 request.request_id.clone(),
@@ -412,10 +381,10 @@ fn write_invocation_result<W: Write>(
                 3,
             ));
         }
-        return launch::run(&request, params, writer);
+        return launch::run(&request, &wire_host["env"], params, writer);
     }
 
-    let response = handle_decoded_invocation(request, subcommand)?;
+    let response = handle_decoded_invocation(request, wire_host, subcommand)?;
     writer
         .write_all(
             serde_json::to_string(&response)
@@ -436,16 +405,16 @@ fn write_invocation_result<W: Write>(
 
 fn handle_decoded_invocation(
     request: RequestEnvelope,
+    wire_host: Value,
     subcommand: &str,
 ) -> Result<Value, ProviderFailure> {
     match subcommand {
         "describe" => Ok(success_response(
             &request.request_id,
-            describe_for(request.host.env.as_ref()),
+            describe_for(Some(&request.host.env)),
         )),
-        resident::PREPARE => {
-            resident::prepare(&request).map(|result| success_response(&request.request_id, result))
-        }
+        resident::PREPARE => resident::prepare(&request, wire_host)
+            .map(|result| success_response(&request.request_id, result)),
         "schema" => schema_response(request),
         "policy.evaluate" => policy_evaluate_response(request),
         "terminal.classify" => terminal_classify_response(request),
@@ -489,52 +458,48 @@ fn subcommand_from_args(args: &[String], request_id: String) -> Result<&str, Pro
     }
 }
 
-fn decode_request(stdin: &str) -> Result<RequestEnvelope, ProviderFailure> {
+fn decode_request(stdin: &str) -> Result<(RequestEnvelope, Value), ProviderFailure> {
     let raw: Value = serde_json::from_str(stdin).map_err(|err| {
         ProviderFailure::invalid_request(
             "unknown".to_string(),
             "invalid_json",
-            format!("stdin must be one UTF-8 JSON object: {err}"),
+            format!(
+                "stdin must be one UTF-8 JSON object (line {}, column {})",
+                err.line(),
+                err.column()
+            ),
         )
     })?;
     let request_id = raw
         .get("request_id")
         .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
+        .filter(|value| !value.is_empty())
         .unwrap_or("unknown")
         .to_string();
-    let request: RequestEnvelope = serde_json::from_value(raw).map_err(|err| {
+    // Preserve the version refusal category without inventing a compatibility
+    // key. All v1 shape/content admission belongs to the SDK definitions.
+    if let Some(contract) = raw.get("contract").and_then(Value::as_str) {
+        if contract != CONTRACT {
+            return Err(ProviderFailure::unsupported(
+                request_id,
+                "unsupported_version",
+                "unsupported contract version; expected oulipoly.provider/v1",
+                3,
+            ));
+        }
+    }
+    admission::envelope(&raw).map_err(|message| {
+        ProviderFailure::invalid_request(request_id.clone(), "invalid_envelope", message)
+    })?;
+    let wire_host = raw["host"].clone();
+    let request = serde_json::from_value(raw).map_err(|_err| {
         ProviderFailure::invalid_request(
-            request_id.clone(),
+            request_id,
             "invalid_envelope",
-            format!("request envelope does not match the provider contract: {err}"),
+            "SDK-admitted envelope cannot be represented",
         )
     })?;
-
-    if request.contract != CONTRACT {
-        return Err(ProviderFailure::unsupported(
-            request.request_id,
-            "unsupported_version",
-            format!("unsupported contract version: {}", request.contract),
-            3,
-        ));
-    }
-    if request.request_id.trim().is_empty() {
-        return Err(ProviderFailure::invalid_request(
-            "unknown".to_string(),
-            "invalid_request_id",
-            "request_id must be a non-empty string",
-        ));
-    }
-    if request.host.app.trim().is_empty() {
-        return Err(ProviderFailure::invalid_request(
-            request.request_id,
-            "invalid_host",
-            "host.app must be a non-empty string",
-        ));
-    }
-
-    Ok(request)
+    Ok((request, wire_host))
 }
 
 fn schema_response(request: RequestEnvelope) -> Result<Value, ProviderFailure> {
@@ -586,7 +551,7 @@ fn policy_evaluate_response(request: RequestEnvelope) -> Result<Value, ProviderF
     append_claude_provider_policy(&policy, &mut argv);
     let mut markers = Vec::new();
     match agent_provider_contract::tool_mediation::required_by_host(
-        request.host.env.as_ref(),
+        Some(&request.host.env),
         Some(&policy.env),
     ) {
         Err(error) => diagnostics.push(diagnostic(
@@ -605,7 +570,7 @@ fn policy_evaluate_response(request: RequestEnvelope) -> Result<Value, ProviderF
                 diagnostics.push(diagnostic("error", &conflict, "tool_mediation_conflict"));
             } else {
                 match admit_exploration(
-                    request.host.env.as_ref(),
+                    Some(&request.host.env),
                     Some(&policy.env),
                     Some(&mediation),
                 ) {
@@ -628,7 +593,7 @@ fn policy_evaluate_response(request: RequestEnvelope) -> Result<Value, ProviderF
         }
         Ok(None) => {
             if let Err((code, message)) =
-                admit_exploration(request.host.env.as_ref(), Some(&policy.env), None)
+                admit_exploration(Some(&request.host.env), Some(&policy.env), None)
             {
                 diagnostics.push(diagnostic("error", &message, code));
             }
@@ -921,90 +886,15 @@ fn session_export_response(request: RequestEnvelope) -> Result<Value, ProviderFa
     ))
 }
 
+/// Structural admission still uses the SDK operation schema, but this adapter
+/// implements neither provider-owned replacement nor its recovery protocol.
+/// Refuse before settings lookup, transcript access or native execution.
 fn session_replace_response(request: RequestEnvelope) -> Result<Value, ProviderFailure> {
-    let request_id = request.request_id.clone();
-    let config_root = request.host.config_root.clone();
-    let provider_instance_id = request.provider_instance_id.clone();
-    let params = decode_session_params(request, "invalid_session_replace_params")?;
-    validate_settings_id(&request_id, &params.settings_id)?;
-    let session_id = require_session_id(&request_id, &params)?;
-    validate_canonical_format(&request_id, &params)?;
-    let replacement_bytes = replacement_bytes(&request_id, &params)?;
-    let replacement_records = parse_canonical_jsonl(&request_id, &replacement_bytes)?;
-    validate_replacement_records(
-        &request_id,
-        &replacement_records,
-        &session_id,
-        &provider_name_for_session(&params),
-    )?;
-    let settings = session_settings_for_request(
-        &params,
-        provider_instance_id.as_deref(),
-        config_root.as_deref(),
-    );
-    let located = locate_transcript(&request_id, &settings, &session_id)?;
-    let provider_name = provider_name_for_session(&params);
-    let existing_records =
-        canonical_records_from_claude_file(&request_id, &located, &session_id, &provider_name)?;
-    let existing_bytes = canonical_jsonl_bytes(&request_id, &existing_records)?;
-    let existing_hash = sha256_hex(&existing_bytes);
-    if let Some(expected) = params.preimage_sha256.as_deref() {
-        if expected != existing_hash {
-            return Err(ProviderFailure::unavailable(
-                request_id,
-                "preimage_mismatch",
-                "session.replace preimage_sha256 does not match current canonical transcript",
-                false,
-                json!({ "expected": expected, "actual": existing_hash }),
-            ));
-        }
-    }
-    let replacement_hash = sha256_hex(&replacement_bytes);
-    if replacement_bytes == existing_bytes {
-        return Ok(success_response(
-            &request_id,
-            json!({
-                "changed": false,
-                "artifacts": [session_artifact(&located, &replacement_hash)],
-            }),
-        ));
-    }
-
-    let rendered = render_claude_records(&request_id, &replacement_records)?;
-    atomic_replace_file(&request_id, &located, &rendered)?;
-    let fresh_records =
-        canonical_records_from_claude_file(&request_id, &located, &session_id, &provider_name)?;
-    let fresh_bytes = canonical_jsonl_bytes(&request_id, &fresh_records)?;
-    let postimage_hash = sha256_hex(&fresh_bytes);
-    if !canonical_semantics_equal(&replacement_records, &fresh_records) {
-        return Err(ProviderFailure::unavailable(
-            request_id,
-            "postimage_mismatch",
-            "fresh canonical export after replace does not match replacement semantics",
-            false,
-            json!({ "replacement_sha256": replacement_hash, "postimage_sha256": postimage_hash }),
-        ));
-    }
-    let artifacts = vec![session_artifact(&located, &postimage_hash)];
-
-    Ok(success_response(
-        &request_id,
-        json!({
-            "changed": true,
-            "postimage_sha256": postimage_hash,
-            "artifacts": artifacts,
-            "host_state_plan": {
-                "schema_version": 1,
-                "operation": "session.replace",
-                "session_id": session_id,
-                "provider_name": provider_name,
-                "canonical_format": "oulipoly.canonical_transcript/v1",
-                "turn_count": fresh_records.len(),
-                "records_sha256": replacement_hash,
-                "postimage_sha256": postimage_hash,
-                "artifacts": artifacts,
-            },
-        }),
+    Err(ProviderFailure::unsupported(
+        request.request_id,
+        "session_replace_unsupported",
+        "session.replace and its recovery protocol are not implemented by the Claude provider",
+        3,
     ))
 }
 
@@ -1351,37 +1241,6 @@ fn require_session_id(request_id: &str, params: &SessionParams) -> Result<String
                 "session_id must be non-empty",
             )
         })
-}
-
-fn validate_canonical_format(
-    request_id: &str,
-    params: &SessionParams,
-) -> Result<(), ProviderFailure> {
-    if params.canonical_format.as_deref() == Some("oulipoly.canonical_transcript/v1") {
-        return Ok(());
-    }
-    Err(ProviderFailure::invalid_request(
-        request_id.to_string(),
-        "invalid_canonical_format",
-        "session.replace requires canonical_format=oulipoly.canonical_transcript/v1",
-    ))
-}
-
-fn replacement_bytes(request_id: &str, params: &SessionParams) -> Result<Vec<u8>, ProviderFailure> {
-    let data = params.data_base64.as_deref().ok_or_else(|| {
-        ProviderFailure::invalid_request(
-            request_id.to_string(),
-            "missing_replacement_data",
-            "session.replace requires data_base64",
-        )
-    })?;
-    decode_base64(data).map_err(|err| {
-        ProviderFailure::invalid_request(
-            request_id.to_string(),
-            "invalid_replacement_base64",
-            format!("data_base64 is invalid: {err}"),
-        )
-    })
 }
 
 fn provider_name_for_session(params: &SessionParams) -> String {
@@ -2146,258 +2005,6 @@ fn canonical_jsonl_bytes(
         bytes.push(b'\n');
     }
     Ok(bytes)
-}
-
-fn parse_canonical_jsonl(
-    request_id: &str,
-    bytes: &[u8],
-) -> Result<Vec<CanonicalRecord>, ProviderFailure> {
-    let text = std::str::from_utf8(bytes).map_err(|err| {
-        ProviderFailure::invalid_request(
-            request_id.to_string(),
-            "invalid_canonical_utf8",
-            format!("canonical transcript is not UTF-8: {err}"),
-        )
-    })?;
-    let mut records = Vec::new();
-    for (index, line) in text.lines().enumerate() {
-        let line_no = index as u64 + 1;
-        if line.trim().is_empty() {
-            return Err(ProviderFailure::invalid_request(
-                request_id.to_string(),
-                "invalid_canonical_transcript",
-                "blank line in canonical JSONL",
-            ));
-        }
-        let record: CanonicalRecord = serde_json::from_str(line).map_err(|err| {
-            ProviderFailure::invalid_request(
-                request_id.to_string(),
-                "invalid_canonical_transcript",
-                format!("malformed canonical JSONL line {line_no}: {err}"),
-            )
-        })?;
-        validate_canonical_record_shape(request_id, line_no, &record)?;
-        records.push(record);
-    }
-    if records.is_empty() {
-        return Err(ProviderFailure::invalid_request(
-            request_id.to_string(),
-            "invalid_canonical_transcript",
-            "empty canonical transcript",
-        ));
-    }
-    if records.iter().all(|record| record.unsupported_record) {
-        return Err(ProviderFailure::invalid_request(
-            request_id.to_string(),
-            "invalid_canonical_transcript",
-            "canonical transcript has no replaceable records",
-        ));
-    }
-    Ok(records)
-}
-
-fn validate_canonical_record_shape(
-    request_id: &str,
-    line: u64,
-    record: &CanonicalRecord,
-) -> Result<(), ProviderFailure> {
-    if record.session_id.is_empty()
-        || record.provider_name.is_empty()
-        || record.turn_id.is_empty()
-        || record.timestamp.is_empty()
-        || (!record.unsupported_record && !matches!(record.role.as_str(), "user" | "assistant"))
-    {
-        return Err(ProviderFailure::invalid_request(
-            request_id.to_string(),
-            "invalid_canonical_transcript",
-            format!("canonical record line {line} is missing required fields"),
-        ));
-    }
-    DateTime::parse_from_rfc3339(&record.timestamp).map_err(|err| {
-        ProviderFailure::invalid_request(
-            request_id.to_string(),
-            "invalid_canonical_transcript",
-            format!("invalid canonical timestamp on line {line}: {err}"),
-        )
-    })?;
-    Ok(())
-}
-
-fn validate_replacement_records(
-    request_id: &str,
-    records: &[CanonicalRecord],
-    session_id: &str,
-    provider_name: &str,
-) -> Result<(), ProviderFailure> {
-    for (index, record) in records.iter().enumerate() {
-        if record.session_id != session_id || record.provider_name != provider_name {
-            return Err(ProviderFailure::invalid_request(
-                request_id.to_string(),
-                "replacement_target_mismatch",
-                format!(
-                    "canonical record line {} does not match target session/provider",
-                    index + 1
-                ),
-            ));
-        }
-        if record.unsupported_record {
-            return Err(ProviderFailure::invalid_request(
-                request_id.to_string(),
-                "replacement_unsupported_record",
-                "unsupported canonical records cannot be rendered into Claude storage",
-            ));
-        }
-        for chunk in &record.content {
-            if chunk.text.is_none() {
-                return Err(ProviderFailure::invalid_request(
-                    request_id.to_string(),
-                    "replacement_unsupported_content",
-                    format!(
-                        "content chunk type {} cannot be rendered without text",
-                        chunk.chunk_type
-                    ),
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn render_claude_records(
-    request_id: &str,
-    records: &[CanonicalRecord],
-) -> Result<Vec<u8>, ProviderFailure> {
-    let mut bytes = Vec::new();
-    for record in records {
-        let content = record
-            .content
-            .iter()
-            .map(|chunk| json!({ "type": chunk.chunk_type, "text": chunk.text.as_deref().unwrap_or("") }))
-            .collect::<Vec<_>>();
-        let line = json!({
-            "type": record.role,
-            "uuid": record.turn_id,
-            "sessionId": record.session_id,
-            "timestamp": record.timestamp,
-            "message": {
-                "role": record.role,
-                "content": content,
-            },
-        });
-        let line = serde_json::to_string(&line).map_err(|err| {
-            ProviderFailure::unavailable(
-                request_id.to_string(),
-                "render_failed",
-                format!("failed to render Claude transcript line: {err}"),
-                false,
-                json!({}),
-            )
-        })?;
-        bytes.extend_from_slice(line.as_bytes());
-        bytes.push(b'\n');
-    }
-    Ok(bytes)
-}
-
-fn canonical_semantics_equal(left: &[CanonicalRecord], right: &[CanonicalRecord]) -> bool {
-    left.len() == right.len()
-        && left.iter().zip(right).all(|(left, right)| {
-            left.session_id == right.session_id
-                && left.provider_name == right.provider_name
-                && left.turn_id == right.turn_id
-                && left.role == right.role
-                && left.timestamp == right.timestamp
-                && left.unsupported_record == right.unsupported_record
-                && content_chunks_equal(&left.content, &right.content)
-        })
-}
-
-fn content_chunks_equal(left: &[ContentChunk], right: &[ContentChunk]) -> bool {
-    left.len() == right.len()
-        && left
-            .iter()
-            .zip(right)
-            .all(|(left, right)| left.chunk_type == right.chunk_type && left.text == right.text)
-}
-
-fn atomic_replace_file(request_id: &str, path: &Path, bytes: &[u8]) -> Result<(), ProviderFailure> {
-    let parent = path.parent().ok_or_else(|| {
-        ProviderFailure::unavailable(
-            request_id.to_string(),
-            "replace_path_invalid",
-            "transcript path has no parent directory",
-            false,
-            json!({ "path": path.display().to_string() }),
-        )
-    })?;
-    let tmp_path = path.with_extension(format!("jsonl.tmp-session-replace-{}", now_unix_ms()));
-    {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp_path)
-            .map_err(|err| {
-                ProviderFailure::unavailable(
-                    request_id.to_string(),
-                    "replace_tmp_write_failed",
-                    format!(
-                        "failed to create replacement temp file {}: {err}",
-                        tmp_path.display()
-                    ),
-                    false,
-                    json!({ "path": tmp_path.display().to_string() }),
-                )
-            })?;
-        file.write_all(bytes).map_err(|err| {
-            ProviderFailure::unavailable(
-                request_id.to_string(),
-                "replace_tmp_write_failed",
-                format!(
-                    "failed to write replacement temp file {}: {err}",
-                    tmp_path.display()
-                ),
-                false,
-                json!({ "path": tmp_path.display().to_string() }),
-            )
-        })?;
-        file.sync_all().map_err(|err| {
-            ProviderFailure::unavailable(
-                request_id.to_string(),
-                "replace_tmp_sync_failed",
-                format!(
-                    "failed to sync replacement temp file {}: {err}",
-                    tmp_path.display()
-                ),
-                false,
-                json!({ "path": tmp_path.display().to_string() }),
-            )
-        })?;
-    }
-    if let Err(err) = fs::rename(&tmp_path, path) {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(ProviderFailure::unavailable(
-            request_id.to_string(),
-            "replace_conflict",
-            format!(
-                "failed to atomically replace transcript {}: {err}",
-                path.display()
-            ),
-            true,
-            json!({ "path": path.display().to_string() }),
-        ));
-    }
-    if let Ok(dir) = File::open(parent) {
-        let _ = dir.sync_all();
-    }
-    Ok(())
-}
-
-fn session_artifact(path: &Path, sha256: &str) -> Value {
-    json!({
-        "kind": "file",
-        "path": path.display().to_string(),
-        "sha256": sha256,
-    })
 }
 
 fn session_context_string(params: &SessionParams, key: &str) -> Option<String> {
