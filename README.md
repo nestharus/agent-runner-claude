@@ -45,7 +45,14 @@ exit 3) before any transcript lookup. The shared contract defines the method
 only as bounded `oulipoly.session_turn_pages/v1` pages; this adapter
 implements no pages and does not advertise `session_turn_pages_v1`, even when
 a host selects it. Generic `session` still covers `session.locate_transcript`,
-`session.capture`, `session.export` and `session.replace`. This adapter does not
+`session.capture` and `session.export`; that family flag does not imply every
+session operation is implemented. SDK-valid `session.replace`, including
+recovery query/commit/rollback, is refused as `unsupported`
+(`session_replace_unsupported`, exit 3) before native or storage effects.
+Provider-owned replacement/recovery remains unfinished under APV-22; no
+old-shape replacement API or compatibility shim is supported. Malformed base
+requests still receive correlated `invalid_request` errors, with bounded
+admission diagnostics that omit submitted value bodies. This adapter does not
 consume the SDK paging engine.
 
 **Launch output (`oulipoly.launch_output/v1`).** A launch whose params carry

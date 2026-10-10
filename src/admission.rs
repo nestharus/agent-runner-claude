@@ -7,7 +7,7 @@ use jsonschema::{Draft, JSONSchema};
 use serde_json::{json, Value};
 use std::sync::OnceLock;
 
-pub(crate) fn envelope(value: &Value) -> Result<(), String> {
+pub(crate) fn envelope(value: &Value) -> Result<(), &'static str> {
     // The SDK operation registry intentionally has no resident.prepare row.
     // Its base envelope still applies to extensions and unsupported commands.
     // Select that definition directly from the SDK, using the existing engine.
@@ -26,12 +26,11 @@ pub(crate) fn envelope(value: &Value) -> Result<(), String> {
             .compile(&schema)
             .expect("SDK base envelope schema")
     });
-    validator.validate(value).map_err(|errors| {
-        errors
-            .map(|error| error.to_string())
-            .collect::<Vec<_>>()
-            .join("; ")
-    })
+    // Engine diagnostics can contain entire submitted values. Only return the
+    // trusted admission boundary, never the validator's value-bearing text.
+    validator
+        .validate(value)
+        .map_err(|_errors| "request envelope does not match SDK common.schema.json#RequestEnvelope")
 }
 
 pub(crate) fn operation(
@@ -60,11 +59,11 @@ pub(crate) fn operation(
     let value = serde_json::to_value(request).expect("SDK request serializes");
     SchemaRegistry::new()
         .validate_request(subcommand, &value)
-        .map_err(|error| {
+        .map_err(|_error| {
             ProviderFailure::invalid_request(
                 request.request_id.clone(),
                 "invalid_params",
-                error.to_string(),
+                format!("{subcommand} request does not match its SDK provider/v1 operation schema"),
             )
         })
 }

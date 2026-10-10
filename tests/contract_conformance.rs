@@ -412,7 +412,7 @@ fn script_store(label: &str, session_id: &str) -> ScriptStore {
 
 impl ScriptStore {
     fn host(&self) -> Value {
-        json!({ "config_root": self.root.display().to_string() })
+        json!({ "config_root": self.root, "data_root": self.root.join("data"), "working_directory": self.root })
     }
 
     /// Every file under the store with its bytes.
@@ -421,6 +421,7 @@ impl ScriptStore {
             for entry in std::fs::read_dir(dir).unwrap() {
                 let path = entry.unwrap().path();
                 if path.is_dir() {
+                    out.insert(path.clone(), Vec::new());
                     walk(&path, out);
                 } else {
                     out.insert(path.clone(), std::fs::read(&path).unwrap());
@@ -556,106 +557,112 @@ fn session_export_returns_canonical_jsonl_bytes_and_hash() {
     let _ = std::fs::remove_dir_all(projects_dir);
 }
 
-#[test]
-fn session_replace_validates_preimage_and_writes_claude_storage_atomically() {
-    let projects_dir = temp_session_root("session-replace");
-    let transcript = write_claude_transcript(&projects_dir, "sess-replace");
-    let export = json_stdout(&invoke(
-        "session.export",
-        session_params(&projects_dir, "sess-replace"),
-    ));
-    let mut records = String::from_utf8(decode_b64(
-        export["result"]["data_base64"].as_str().unwrap(),
-    ))
-    .unwrap()
-    .lines()
-    .map(|line| serde_json::from_str::<Value>(line).unwrap())
-    .collect::<Vec<_>>();
-    records[0]["content"][0]["text"] = json!("replacement user body");
-    records[1]["content"][0]["text"] = json!("replacement assistant body");
-    let replacement = records
-        .iter()
-        .map(Value::to_string)
-        .collect::<Vec<_>>()
-        .join("\n")
-        + "\n";
-    let replacement_bytes = replacement.as_bytes();
-    let output = invoke(
-        "session.replace",
-        json!({
-            "settings_id": "claude-primary",
-            "session_id": "sess-replace",
-            "provider_name": "claude-primary",
-            "canonical_format": "oulipoly.canonical_transcript/v1",
-            "data_base64": encode_b64(replacement_bytes),
-            "preimage_sha256": export["result"]["sha256"],
-            "context": session_context(&projects_dir)
-        }),
-    );
-    assert!(output.status.success());
-    let response = json_stdout(&output);
-    let schema = compile_contract_ref("session.schema.json", "SessionReplaceResponse");
-    assert_valid(&schema, &response);
-    assert_eq!(response["result"]["changed"], true);
-    assert_ne!(
-        response["result"]["postimage_sha256"],
-        sha256_hex(replacement_bytes)
-    );
-    assert_eq!(
-        response["result"]["host_state_plan"]["records_sha256"],
-        sha256_hex(replacement_bytes)
-    );
-    assert_eq!(
-        response["result"]["host_state_plan"]["postimage_sha256"],
-        response["result"]["postimage_sha256"]
-    );
-    let native = std::fs::read_to_string(&transcript).unwrap();
-    assert!(native.contains("replacement user body"));
-    assert!(native.contains("replacement assistant body"));
+// Independent current SDK/Runner intent: normal replacement carries canonical
+// bytes and recovery carries the empty placeholder, not the retired top-level
+// data_base64/context shape. Expected outcome here is truthful non-support.
+fn current_replace_params(session_id: &str, bytes: &[u8], turn_count: u64) -> Value {
+    json!({
+        "settings_id": "claude-primary", "session_id": session_id,
+        "model_name": "fixture", "provider_name": "claude-primary",
+        "replace_protocol": "oulipoly.provider_owned_replace/v1",
+        "operation_id": "fixture-operation",
+        "canonical_format": "oulipoly.canonical_transcript/v1",
+        "canonical_transcript": { "kind": "bytes", "data_base64": encode_b64(bytes),
+            "sha256": sha256_hex(bytes), "turn_count": turn_count },
+        "host_apply_capability": "replace_session_turns_from_canonical_v1"
+    })
+}
 
-    let mismatch = invoke(
-        "session.replace",
-        json!({
-            "settings_id": "claude-primary",
-            "session_id": "sess-replace",
-            "provider_name": "claude-primary",
-            "canonical_format": "oulipoly.canonical_transcript/v1",
-            "data_base64": encode_b64(replacement_bytes),
-            "preimage_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
-            "context": session_context(&projects_dir)
-        }),
+fn assert_current_replace_refused(store: &ScriptStore, params: Value) {
+    let mut host = store.host();
+    host["app"] = json!("oulipoly-agent-runner");
+    agent_provider_contract::SchemaRegistry::new()
+        .validate_request(
+            "session.replace",
+            &json!({"contract": CONTRACT,
+            "request_id": "req-session.replace", "provider_instance_id": "claude-primary",
+            "host": host, "params": params}),
+        )
+        .expect("refusal control must first be SDK-valid");
+    let before = store.snapshot();
+    let output = invoke_with_host("session.replace", params, store.host());
+    assert_eq!(output.status.code(), Some(3));
+    let response = json_stdout(&output);
+    agent_provider_contract::SchemaRegistry::new()
+        .validate_error_response("session.replace", &response)
+        .unwrap();
+    assert_eq!(response["request_id"], "req-session.replace");
+    assert_eq!(response["ok"], false);
+    assert!(response.get("result").is_none());
+    assert_eq!(response["error"]["category"], "unsupported");
+    assert_eq!(response["error"]["code"], "session_replace_unsupported");
+    assert_eq!(response["error"]["retryable"], false);
+    assert_eq!(
+        store.snapshot(),
+        before,
+        "no native, storage or journal effects"
     );
-    assert_eq!(mismatch.status.code(), Some(1));
-    let response = json_stdout(&mismatch);
-    assert_eq!(response["error"]["code"], "preimage_mismatch");
-    let _ = std::fs::remove_dir_all(projects_dir);
+    assert!(!store.marker.exists());
 }
 
 #[test]
-fn session_replace_reports_no_change_for_identical_canonical_input() {
-    let projects_dir = temp_session_root("session-replace-no-change");
-    write_claude_transcript(&projects_dir, "sess-no-change");
-    let export = json_stdout(&invoke(
-        "session.export",
-        session_params(&projects_dir, "sess-no-change"),
-    ));
-    let output = invoke(
-        "session.replace",
-        json!({
-            "settings_id": "claude-primary",
-            "session_id": "sess-no-change",
-            "provider_name": "claude-primary",
-            "canonical_format": "oulipoly.canonical_transcript/v1",
-            "data_base64": export["result"]["data_base64"],
-            "preimage_sha256": export["result"]["sha256"],
-            "context": session_context(&projects_dir)
-        }),
+fn session_replace_refuses_sdk_valid_normal_input_before_native_or_storage_effects() {
+    let store = script_store("session-replace-unsupported", "sess-replace");
+    // Positive control: a legitimate locate/export can reach this exact fake
+    // store, so missing effects are not merely an unusable native fixture.
+    let output = invoke_with_host(
+        "session.locate_transcript",
+        json!({"settings_id":"claude-primary", "session_id":"sess-replace"}),
+        store.host(),
     );
     assert!(output.status.success());
+    assert!(store.marker.exists());
+    std::fs::remove_file(&store.marker).unwrap();
+    let bytes = b"{\"session_id\":\"sess-replace\",\"provider_name\":\"claude-primary\",\"turn_id\":\"chosen-user\",\"role\":\"user\",\"timestamp\":\"2026-06-02T12:00:00Z\",\"content\":[{\"type\":\"text\",\"text\":\"independently chosen user content\"}],\"unsupported_record\":false}\n";
+    let params = current_replace_params("sess-replace", bytes, 1);
+    assert_current_replace_refused(&store, params.clone());
+    let mut with_preimage = params;
+    with_preimage["preimage_sha256_expected"] = json!("0".repeat(64));
+    assert_current_replace_refused(&store, with_preimage);
+    std::fs::remove_dir_all(store.root).unwrap();
+}
+
+#[test]
+fn session_replace_refuses_sdk_valid_recovery_query_commit_and_rollback() {
+    let store = script_store("session-replace-recovery", "sess-recover");
+    for action in ["query", "commit", "rollback"] {
+        let mut params = current_replace_params("sess-recover", b"", 0);
+        params["operation_mode"] = json!("recover");
+        params["recovery_action"] = json!(action);
+        params["recovery_id"] = json!("fixture-recovery");
+        assert_current_replace_refused(&store, params);
+    }
+    std::fs::remove_dir_all(store.root).unwrap();
+}
+
+#[test]
+fn obsolete_replace_shape_is_invalid_not_an_unsupported_operation_control() {
+    let store = script_store("session-replace-old-shape", "sess-old");
+    let before = store.snapshot();
+    let params = json!({"settings_id":"claude-primary", "session_id":"sess-old",
+        "provider_name":"claude-primary", "canonical_format":"oulipoly.canonical_transcript/v1",
+        "data_base64":"", "preimage_sha256":"0".repeat(64), "context":session_context(&store.root)});
+    assert!(agent_provider_contract::SchemaRegistry::new()
+        .validate_request(
+            "session.replace",
+            &json!({"contract":CONTRACT, "request_id":"req-session.replace",
+            "host":{"app":"test"}, "params":params})
+        )
+        .is_err());
+    let output = invoke_with_host("session.replace", params, store.host());
+    assert_eq!(output.status.code(), Some(2));
     let response = json_stdout(&output);
-    assert_eq!(response["result"]["changed"], false);
-    assert!(response["result"]["host_state_plan"].is_null());
-    let _ = std::fs::remove_dir_all(projects_dir);
+    assert_eq!(response["request_id"], "req-session.replace");
+    assert_eq!(response["error"]["category"], "invalid_request");
+    assert_eq!(response["error"]["code"], "invalid_params");
+    assert_eq!(store.snapshot(), before);
+    assert!(!store.marker.exists());
+    std::fs::remove_dir_all(store.root).unwrap();
 }
 
 #[test]
