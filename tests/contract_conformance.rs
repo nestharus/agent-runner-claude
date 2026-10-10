@@ -730,7 +730,9 @@ fn quota_source_rejects_non_object_context() {
     let schema = compile_contract_ref("common.schema.json", "ErrorResponseEnvelope");
     assert_valid(&schema, &response);
     assert_eq!(response["error"]["category"], "invalid_request");
-    assert_eq!(response["error"]["code"], "invalid_quota_context");
+    // The common operation schema now refuses this before Claude quota
+    // interpretation; QuotaContext is contractually an object.
+    assert_eq!(response["error"]["code"], "invalid_params");
 }
 
 #[test]

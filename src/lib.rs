@@ -12,6 +12,7 @@ use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod admission;
 mod launch;
 mod mediation;
 pub mod resident;
@@ -47,36 +48,9 @@ pub struct InvocationOutput {
     pub exit_code: i32,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct RequestEnvelope {
-    contract: String,
-    request_id: String,
-    #[allow(dead_code)]
-    provider_instance_id: Option<String>,
-    host: HostContext,
-    params: Value,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct HostContext {
-    app: String,
-    #[allow(dead_code)]
-    app_version: Option<String>,
-    #[allow(dead_code)]
-    platform: Option<String>,
-    #[allow(dead_code)]
-    working_directory: Option<String>,
-    #[allow(dead_code)]
-    config_root: Option<String>,
-    #[allow(dead_code)]
-    data_root: Option<String>,
-    #[allow(dead_code)]
-    env: Option<BTreeMap<String, String>>,
-    #[allow(dead_code)]
-    deadline_unix_ms: Option<u64>,
-}
+// Base wire representations come from the resolved SDK. Adapter projections
+// below are consumed only after shared schema admission.
+pub(crate) use agent_provider_contract::generated::{HostContext, RequestEnvelope};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -383,14 +357,15 @@ fn write_invocation_result<W: Write>(
     stdin: &str,
     writer: &mut W,
 ) -> Result<i32, ProviderFailure> {
-    let request = decode_request(stdin)?;
+    let (request, wire_host) = decode_request(stdin)?;
     let subcommand = subcommand_from_args(args, request.request_id.clone())?;
+    admission::operation(subcommand, &request)?;
     if subcommand == "launch" {
         let params = decode_launch_params(&request)?;
         // Mediation is served by resident turns only; a one-shot launch
         // never runs a policy it would not apply.
         let mediated = agent_provider_contract::tool_mediation::required_by_host(
-            request.host.env.as_ref(),
+            Some(&request.host.env),
             Some(&params.env),
         );
         if !matches!(mediated, Ok(None)) {
@@ -403,7 +378,7 @@ fn write_invocation_result<W: Write>(
         }
         // An exploration offer needs mediation, so it is refused here too.
         if let Err((code, message)) =
-            admit_exploration(request.host.env.as_ref(), Some(&params.env), None)
+            admit_exploration(Some(&request.host.env), Some(&params.env), None)
         {
             return Err(ProviderFailure::unsupported(
                 request.request_id.clone(),
@@ -412,10 +387,10 @@ fn write_invocation_result<W: Write>(
                 3,
             ));
         }
-        return launch::run(&request, params, writer);
+        return launch::run(&request, &wire_host["env"], params, writer);
     }
 
-    let response = handle_decoded_invocation(request, subcommand)?;
+    let response = handle_decoded_invocation(request, wire_host, subcommand)?;
     writer
         .write_all(
             serde_json::to_string(&response)
@@ -436,16 +411,16 @@ fn write_invocation_result<W: Write>(
 
 fn handle_decoded_invocation(
     request: RequestEnvelope,
+    wire_host: Value,
     subcommand: &str,
 ) -> Result<Value, ProviderFailure> {
     match subcommand {
         "describe" => Ok(success_response(
             &request.request_id,
-            describe_for(request.host.env.as_ref()),
+            describe_for(Some(&request.host.env)),
         )),
-        resident::PREPARE => {
-            resident::prepare(&request).map(|result| success_response(&request.request_id, result))
-        }
+        resident::PREPARE => resident::prepare(&request, wire_host)
+            .map(|result| success_response(&request.request_id, result)),
         "schema" => schema_response(request),
         "policy.evaluate" => policy_evaluate_response(request),
         "terminal.classify" => terminal_classify_response(request),
@@ -489,7 +464,7 @@ fn subcommand_from_args(args: &[String], request_id: String) -> Result<&str, Pro
     }
 }
 
-fn decode_request(stdin: &str) -> Result<RequestEnvelope, ProviderFailure> {
+fn decode_request(stdin: &str) -> Result<(RequestEnvelope, Value), ProviderFailure> {
     let raw: Value = serde_json::from_str(stdin).map_err(|err| {
         ProviderFailure::invalid_request(
             "unknown".to_string(),
@@ -500,41 +475,33 @@ fn decode_request(stdin: &str) -> Result<RequestEnvelope, ProviderFailure> {
     let request_id = raw
         .get("request_id")
         .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
+        .filter(|value| !value.is_empty())
         .unwrap_or("unknown")
         .to_string();
-    let request: RequestEnvelope = serde_json::from_value(raw).map_err(|err| {
+    // Preserve the version refusal category without inventing a compatibility
+    // key. All v1 shape/content admission belongs to the SDK definitions.
+    if let Some(contract) = raw.get("contract").and_then(Value::as_str) {
+        if contract != CONTRACT {
+            return Err(ProviderFailure::unsupported(
+                request_id,
+                "unsupported_version",
+                format!("unsupported contract version: {contract}"),
+                3,
+            ));
+        }
+    }
+    admission::envelope(&raw).map_err(|message| {
+        ProviderFailure::invalid_request(request_id.clone(), "invalid_envelope", message)
+    })?;
+    let wire_host = raw["host"].clone();
+    let request = serde_json::from_value(raw).map_err(|err| {
         ProviderFailure::invalid_request(
-            request_id.clone(),
+            request_id,
             "invalid_envelope",
-            format!("request envelope does not match the provider contract: {err}"),
+            format!("SDK-admitted envelope cannot be represented: {err}"),
         )
     })?;
-
-    if request.contract != CONTRACT {
-        return Err(ProviderFailure::unsupported(
-            request.request_id,
-            "unsupported_version",
-            format!("unsupported contract version: {}", request.contract),
-            3,
-        ));
-    }
-    if request.request_id.trim().is_empty() {
-        return Err(ProviderFailure::invalid_request(
-            "unknown".to_string(),
-            "invalid_request_id",
-            "request_id must be a non-empty string",
-        ));
-    }
-    if request.host.app.trim().is_empty() {
-        return Err(ProviderFailure::invalid_request(
-            request.request_id,
-            "invalid_host",
-            "host.app must be a non-empty string",
-        ));
-    }
-
-    Ok(request)
+    Ok((request, wire_host))
 }
 
 fn schema_response(request: RequestEnvelope) -> Result<Value, ProviderFailure> {
@@ -586,7 +553,7 @@ fn policy_evaluate_response(request: RequestEnvelope) -> Result<Value, ProviderF
     append_claude_provider_policy(&policy, &mut argv);
     let mut markers = Vec::new();
     match agent_provider_contract::tool_mediation::required_by_host(
-        request.host.env.as_ref(),
+        Some(&request.host.env),
         Some(&policy.env),
     ) {
         Err(error) => diagnostics.push(diagnostic(
@@ -605,7 +572,7 @@ fn policy_evaluate_response(request: RequestEnvelope) -> Result<Value, ProviderF
                 diagnostics.push(diagnostic("error", &conflict, "tool_mediation_conflict"));
             } else {
                 match admit_exploration(
-                    request.host.env.as_ref(),
+                    Some(&request.host.env),
                     Some(&policy.env),
                     Some(&mediation),
                 ) {
@@ -628,7 +595,7 @@ fn policy_evaluate_response(request: RequestEnvelope) -> Result<Value, ProviderF
         }
         Ok(None) => {
             if let Err((code, message)) =
-                admit_exploration(request.host.env.as_ref(), Some(&policy.env), None)
+                admit_exploration(Some(&request.host.env), Some(&policy.env), None)
             {
                 diagnostics.push(diagnostic("error", &message, code));
             }
